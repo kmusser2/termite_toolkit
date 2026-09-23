@@ -1,0 +1,10 @@
+# Seeded example tools (intentionally untracked; see AGENTS.md)
+TOOLKIT/**
+
+# Scratch space: transient artifacts, never committed
+tmp/
+
+# Python bytecode
+__pycache__/
+*.pyc
+

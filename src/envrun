@@ -1,0 +1,13 @@
+#!/bin/sh
+# keywords: env|environment|home|pip-config|git-config|cache|wrapper|run|sandbox
+# examples: TOOLKIT/envrun python3 -m pip install numpy | TOOLKIT/envrun git commit -m "msg" | TOOLKIT/envrun ./venv/bin/python -m pip install -r requirements.txt
+# envrun: run a command with the sandbox's writable HOME + pip cache config.
+# Usage: TOOLKIT/envrun <cmd> [args...]
+#   TOOLKIT/envrun python3 -m pip install ...
+#   TOOLKIT/envrun git commit -m ...
+#   TOOLKIT/envrun ./venv/bin/python -m pip install ...
+export HOME=/var/lib/llmchat-sandbox/home
+export PIP_CONFIG_FILE=/var/lib/llmchat-sandbox/pip.conf
+export GIT_CONFIG_GLOBAL=/var/lib/llmchat-sandbox/home/.gitconfig
+export XDG_CACHE_HOME=/var/lib/llmchat-sandbox/.pipcache
+exec "$@"
