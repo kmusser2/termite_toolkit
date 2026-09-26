@@ -95,6 +95,11 @@ write/append) or `src/fedit.py` for quick line-based tweaks.
 `hedit --preview`, `git diff`, or `difflib`) or two files side-by-side as a
 boxed table, in SGR color or HTML.
 
+**C++ semantics** — use `src/clangd.py` to ask a real clangd for
+compiler-accurate diagnostics, hover, definitions and references, driven by the
+project's `compile_commands.json` (it never runs a build: a missing or stale
+database is reported, not regenerated).
+
 **Building/running C/C++** — `src/build.py` (compile C/C++, syntax-check, or run
 a binary). **Driving interactive/TUI apps** — `src/pty_run.py` (feed keystrokes
 through a pseudo-terminal and capture the raw ANSI stream; pair with
