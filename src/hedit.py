@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 """hedit.py - Hash-anchored line editor for AI agents.
-# keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply
-# examples: import hedit; hedit.read_file("main.cpp") | import hedit; hedit.replace("main.cpp", "12#a1b2", ["return 0;"], preview=True) | import hedit; hedit.batch("main.cpp", [{"op": "replace", "anchor": "12#a1b2", "lines": ["x = 1"]}], preview=True)
+# keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply|read|grep|pattern|regex|match|search|window|context|discover|navigate
+# examples: import hedit; print(hedit.read_file("main.cpp")) | import hedit; print(hedit.read_file("main.cpp", pattern="^def ", context=2)) | import hedit; print(hedit.window(hedit.match("main.cpp", pattern="return"), before=1, after=1)) | import hedit; hedit.replace("main.cpp", "12#a1b2", ["return 0;"], preview=True) | import hedit; hedit.batch("main.cpp", [{"op": "replace", "anchor": "12#a1b2", "lines": ["x = 1"]}], preview=True)
 
 Implements the "hashline" editing idea (Can Boluk / hledit / Dirac):
 instead of tracking line numbers, each line is tagged with a short content
@@ -21,36 +21,66 @@ Credits & attribution:
 
 License: MIT.
 
+READING (start here) -- read_file() returns a ReadResult that *renders as the
+anchored lines*, so you can emit it directly; no formatting needed:
+    res = hedit.read_file("foo.py")                         # whole file
+    res = hedit.read_file("foo.py", offset=40, limit=20)    # a page
+    res = hedit.read_file("foo.py", pattern="int|double", context=2)  # regex + window
+    res = hedit.read_file("foo.py", grep="TODO", context=1)          # literal + window
+    print(res)      # one "LN#HASH|text" per line, e.g. 12#NKA|return 0;
+  pattern= is a regex (re.search per line); grep= is a literal substring; give
+  one, not both. context= keeps N lines around each match (spans merged).
+  offset/limit (a page) cannot be combined with a filter. A filtered read that
+  matched nothing prints  "# no matches for pattern='...'".
+  ReadResult is a dict: res["lines"] (list of Line), res["hits"] (matched
+  line numbers; [] means none), res["windows"] (returned [start,end] ranges),
+  res["payload"] (the printable lines), res["query"] (the filter that ran, or
+  None for a whole-file/page read), res["truncated"], res["next_offset"],
+  res["total_lines"]. Read res["query"] to tell a filter that matched nothing
+  (query set, hits == []) from a page (query None).
+
+DISCOVER, THEN EXPAND (one expression, no second round-trip):
+    m   = hedit.match("foo.py", pattern="^def ")   # -> Match(path, hits, query)
+    res = hedit.window(m, before=1, after=2)        # each hit +/- context, merged
+  match() finds line numbers only; window() returns the surrounding lines.
+
+ANCHORS -- an anchor is "LN#HASH" (e.g. 12#NKA). Each Line prints as
+"LN#HASH|text" and has .anchor -> "LN#HASH" for the edit ops. A Line's digest
+(the hash) alone is NOT an anchor and will be rejected.
+
+EDITING (stale-safe; nothing is written when an anchor is bad or stale):
+    hedit.replace("foo.py", "12#NKA", ["new line"])           -> {"ok": True, ...}
+    hedit.replace("foo.py", "12#NKA", ["new"], preview=True)  -> {"ok": True, "preview": True, "diff": "...", ...} (no write)
+    hedit.insert("foo.py", "12#NKA", ["x"], before=True)      # default inserts after
+    hedit.delete("foo.py", "12#NKA")                          # or an [anchor, end_anchor] range
+    hedit.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
+    hedit.hash_line("def f():", 12)                           -> "NKA"
+
+ERRORS -- an edit returns {"ok": false, "error": TAG, "message": ...} and writes
+nothing. TAG is "stale" (anchor well-formed but the line changed), "validation"
+(bad batch edit shape), or "usage" (malformed args: bad regex, bad anchor,
+incompatible options). "io" is filesystem/size/encoding. The CLI prints the same
+JSON on stdout and exits 2 for "usage", 1 otherwise.
+
 CLI:
-  ./hedit.py read <file> [--offset N] [--limit M] [--grep PAT] [--context N]
-                   [--plain] [--json]
+  ./hedit.py read <file> [--offset N] [--limit M] [--pattern RE | --grep PAT]
+                   [--context N] [--plain] [--json]
   ./hedit.py replace <file> <anchor> [<end-anchor>] [--new-text TEXT | --file F | -] [--preview]
   ./hedit.py insert <file> <anchor> [--before|--after] [--new-text TEXT | --file F | -] [--preview]
   ./hedit.py delete <file> <anchor> [<end-anchor>] [--preview]
   ./hedit.py batch <file> [--preview]   # JSON edits on stdin: op anchor end_anchor
                    # lines new_text before; --preview prints diff, no write
   ./hedit.py --selftest
-
-Read output format:  LN#HASH|text
-Anchors:             LN#HASH   (e.g. 12#NKA)
-Stale edits return JSON: {"ok":false,"error":"stale","message":"anchor 12#NKA: stale"}
-
-Python API:
-  import hedit
-  hedit.read_file("foo.py")                      -> [(ln, anchor, text), ...]
-  hedit.replace("foo.py", "12#NKA", ["new line"]) -> {"ok": True, ...}
-  hedit.replace("foo.py", "12#NKA", ["new"], preview=True)  # -> {"ok": True, "preview": True, "diff": "..."} (no write)
-  hedit.hash_line("def f():", 12)                -> "NKA"
-  hedit.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
 """
 
 import argparse
 import difflib
 import json
 import os
+import re
 import stat
 import sys
-from typing import Any, Sequence, TypedDict
+from typing import Any, Iterable, NamedTuple, Sequence, TypedDict
 
 HASH_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 chars, drops 0/O/1/I
 HASH_LEN = 3
@@ -71,6 +101,78 @@ class Edit(TypedDict, total=False):
     new_text: str
     before: bool
 
+
+
+# --------------------------------------------------------------------------
+# Records & errors
+# --------------------------------------------------------------------------
+
+class UsageError(ValueError):
+    """Caller/argument error: bad regex, bad anchor, or incompatible options.
+
+    Subclasses ValueError so existing "except ValueError" callers still catch
+    it. The CLI reports it as {"ok": false, "error": "usage"} (exit 2), as
+    opposed to "io" (filesystem/size/encoding, exit 1).
+    """
+
+
+class Line(NamedTuple):
+    """One file line: number ln (1-based), content hash digest, raw text.
+
+    Prints as the canonical anchored form "LN#HASH|text" (e.g. 12#NKA|return 0;)
+    so emitting a Line can never lose its line number. .anchor gives the
+    "LN#HASH" string the edit ops accept; digest alone is NOT an anchor.
+    """
+
+    ln: int
+    digest: str
+    text: str
+
+    @property
+    def anchor(self) -> str:
+        """The 'LN#HASH' anchor accepted by replace/insert/delete/batch."""
+        return "%d#%s" % (self.ln, self.digest)
+
+    def __str__(self) -> str:
+        return "%d#%s|%s" % (self.ln, self.digest, self.text)
+
+    __repr__ = __str__
+
+
+class Match(NamedTuple):
+    """Filter result from match(): path, matched line numbers hits (1-based),
+    and query (e.g. "pattern='^def '", used in "no matches" messages). Pass it
+    to window() to expand the hits into surrounding lines."""
+
+    path: str
+    hits: list[int]
+    query: str
+
+
+class ReadResult(dict):
+    """read_file()/window() result: the documented dict that ALSO renders as the
+    anchored lines, so it can be handed back directly with no formatting.
+
+    str(res)/repr(res) return the payload block -- one "LN#HASH|text" per line
+    (bare text when plain=True) -- or "# no matches for <query>" when a
+    pattern/grep filter matched nothing. It is a real dict; keys are "ok",
+    "lines", "hits", "windows", "payload", "truncated", "next_offset",
+    "total_lines", "query". "query" is the filter that ran (e.g.
+    "pattern='^def '"), or None for a whole-file/page read -- so read it to tell
+    "a filter matched nothing" (query set, hits == []) apart from "this was a
+    page" (query None). Use dict(res) to see the raw mapping.
+    """
+
+    def __str__(self) -> str:
+        payload = self.get("payload") or []
+        if payload:
+            return "\n".join(payload)
+        query = self.get("query")
+        if query is not None:
+            return "# no matches for %s" % query
+        return ""
+
+    __repr__ = __str__
 
 
 # --------------------------------------------------------------------------
@@ -168,41 +270,132 @@ def write_lines_atomic(path: str, lines: Sequence[str], ending: str = "\n") -> N
 # Read
 # --------------------------------------------------------------------------
 
-def read_file(path: str, offset: int | None = None, limit: int | None = None, grep: str | None = None, context: int | None = None, plain: bool = False) -> dict[str, Any]:
-    """Read a file with LN#HASH anchors, supporting offset/limit/grep/context windows and plain output."""
+def read_file(path: str, offset: int | None = None, limit: int | None = None,
+              grep: str | None = None, context: int | None = None,
+              plain: bool = False, pattern: str | None = None) -> ReadResult:
+    """Read a file, returning a ReadResult that prints as "LN#HASH|text" lines.
+
+    Pick one mode:
+      * whole file      -- read_file(path)
+      * a page          -- read_file(path, offset=40, limit=20)
+      * filtered window -- read_file(path, pattern=RE, context=N)
+                           read_file(path, grep=LITERAL, context=N)
+
+    pattern= is a regex (re.search on each line); grep= is a literal substring.
+    context= keeps N lines on each side of a match (spans that touch are merged).
+    Give pattern or grep, never both. offset/limit cannot be combined with a
+    filter, and context= is only meaningful together with one.
+
+    Returns a ReadResult (a dict that str()s as the payload): res["lines"]
+    (list of Line), res["hits"] (matched 1-based line numbers), res["windows"]
+    (returned [start, end] ranges), res["payload"] (the printable lines),
+    res["query"] (the filter that ran, or None for a page), res["truncated"],
+    res["next_offset"], res["total_lines"]. In filter mode hits == [] means no
+    match; in page mode hits is always [] (read res["query"] to distinguish).
+    Raises UsageError on malformed or incompatible arguments.
+    """
+    if pattern is not None and grep is not None:
+        raise UsageError("give pattern= (regex) or grep= (literal), not both")
+    if pattern is not None or grep is not None:
+        if offset is not None or limit is not None:
+            raise UsageError("offset/limit cannot be combined with pattern/grep; "
+                             "use context=N for a window around matches")
+        ctx = context or 0
+        return window(match(path, pattern=pattern, grep=grep),
+                      before=ctx, after=ctx, plain=plain)
+    if context is not None:
+        raise UsageError("context= only applies with pattern= or grep=")
     lines, _ = read_lines(path)
-    out = []
     total = len(lines)
     start, end = 0, total
-
-    if grep is not None:
-        hits = [i for i, ln in enumerate(lines) if grep in ln]
-        if context is None:
-            context = 0
-        if hits:
-            start = max(0, hits[0] - context)
-            end = min(total, hits[-1] + context + 1)
-        else:
-            start, end = 0, 0
-    else:
-        if offset is not None:
-            start = max(0, offset - 1)
-        if limit is not None:
-            end = min(total, start + limit)
-
+    if offset is not None:
+        start = max(0, offset - 1)
+    if limit is not None:
+        end = min(total, start + limit)
+    records = _records(lines, range(start, end))
     truncated = end < total
-    for i in range(start, end):
-        ln = i + 1
-        text = lines[i]
-        out.append((ln, hash_line(text, ln), text))
+    return _result(records, hits=[], windows=[(start + 1, end)] if records else [],
+                   total=total, truncated=truncated,
+                   next_offset=end + 1 if truncated else None,
+                   plain=plain, query=None)
 
-    if plain:
-        payload = [t for (_, _, t) in out]
+
+def match(path: str, pattern: str | None = None,
+          grep: str | None = None) -> Match:
+    """Find matching line numbers in a file; returns Match(path, hits, query).
+
+    Uses exactly one of pattern= (a regex, re.search per line) or grep= (a
+    literal substring); giving neither or both raises UsageError, as does an
+    invalid regex. hits are 1-based line numbers ([] means no match). The file
+    body is not returned -- pass the Match to window() to get those lines with
+    context. This is the discovery half of read_file(pattern=...).
+    """
+    if (pattern is None) == (grep is None):
+        raise UsageError("match() needs exactly one of pattern= or grep=")
+    lines, _ = read_lines(path)
+    if pattern is not None:
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            raise UsageError("invalid pattern %r: %s" % (pattern, e)) from e
+        hits = [i + 1 for i, ln in enumerate(lines) if rx.search(ln)]
+        query = "pattern=%r" % pattern
     else:
-        payload = ["%d#%s|%s" % (ln, h, t) for (ln, h, t) in out]
-    return {"ok": True, "lines": out, "truncated": truncated,
-            "next_offset": end + 1 if truncated else None, "payload": payload,
-            "total_lines": total}
+        hits = [i + 1 for i, ln in enumerate(lines) if grep in ln]
+        query = "grep=%r" % grep
+    return Match(path, hits, query)
+
+
+def window(m: Match, before: int = 0, after: int = 0,
+           plain: bool = False) -> ReadResult:
+    """Expand a Match's hits to surrounding lines and return them.
+
+    Each hit is widened to [hit - before, hit + after]; windows that overlap or
+    touch are merged, so scattered hits do not drag in the lines between them.
+    before and after need not be equal. Returns the same ReadResult as
+    read_file(): res["lines"] carry their true line numbers, so anchors stay
+    valid across the gaps. Raises UsageError if before/after is negative.
+    """
+    if before < 0 or after < 0:
+        raise UsageError("before/after must be >= 0")
+    lines, _ = read_lines(m.path)
+    total = len(lines)
+    wins = _merge_windows(m.hits, before, after, total)
+    records = _records(lines, [i for (s, e) in wins for i in range(s - 1, e)])
+    return _result(records, hits=list(m.hits), windows=wins, total=total,
+                   truncated=False, next_offset=None, plain=plain, query=m.query)
+
+
+def _merge_windows(hits: Sequence[int], before: int, after: int,
+                   total: int) -> list[tuple[int, int]]:
+    """Merge each 1-based hit +/- context into disjoint [start, end] windows,
+    combining spans that overlap or touch."""
+    spans: list[tuple[int, int]] = []
+    for h in hits:
+        s, e = max(1, h - before), min(total, h + after)
+        if s > e:
+            continue
+        if spans and s <= spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+        else:
+            spans.append((s, e))
+    return spans
+
+
+def _records(lines: Sequence[str], indices: Iterable[int]) -> list[Line]:
+    """Build Line records (1-based ln, content hash, text) for the given indices."""
+    return [Line(i + 1, hash_line(lines[i], i + 1), lines[i]) for i in indices]
+
+
+def _result(records: Sequence[Line], hits: list[int],
+            windows: list[tuple[int, int]], total: int, truncated: bool,
+            next_offset: int | None, plain: bool, query: str | None) -> ReadResult:
+    """Assemble a ReadResult from records plus its metadata."""
+    payload = ([r.text for r in records] if plain else
+               ["%d#%s|%s" % (r.ln, r.digest, r.text) for r in records])
+    return ReadResult(ok=True, lines=list(records), hits=hits, windows=windows,
+                      payload=payload, truncated=truncated,
+                      next_offset=next_offset, total_lines=total, query=query)
 
 
 # --------------------------------------------------------------------------
@@ -213,7 +406,7 @@ def _validate_anchor(lines, anchor):
     """Return (index) if anchor's line+hash matches current content, else None."""
     parsed = parse_anchor(anchor)
     if parsed is None:
-        raise ValueError("invalid anchor %r (want LN#HASH)" % anchor)
+        raise UsageError("invalid anchor %r (want LN#HASH, e.g. 12#NKA)" % (anchor,))
     ln, h = parsed
     if ln < 1 or ln > len(lines):
         return None
@@ -235,7 +428,7 @@ def replace(path: str, anchor: str, new_lines: str | Sequence[str], end_anchor: 
         if e is None:
             return _stale(end_anchor)
         if e < idx:
-            raise ValueError("end_anchor precedes start anchor")
+            raise UsageError("end_anchor precedes start anchor")
         end_idx = e
     if isinstance(new_lines, str):
         new_lines = [new_lines]
@@ -317,7 +510,7 @@ def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> dict[str, 
             if end_idx is None:
                 return _stale(e["end_anchor"])
             if end_idx < idx:
-                raise ValueError("end_anchor precedes start anchor")
+                raise UsageError("end_anchor precedes start anchor")
         if op in ("replace", "insert"):
             raw = e.get("lines", e.get("new_text"))
             if raw is None:
@@ -370,20 +563,31 @@ def _read_args(parser, args):
     path = args.file
     try:
         res = read_file(path, offset=args.offset, limit=args.limit,
-                        grep=args.grep, context=args.context, plain=args.plain)
+                        grep=args.grep, context=args.context, plain=args.plain,
+                        pattern=args.pattern)
+    except UsageError as e:
+        print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
+        return 2
+    except UsageError as e:
+        print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
+        return 2
     except Exception as e:
         print(json.dumps({"ok": False, "error": "io", "message": str(e)}))
         return 1
     if args.json:
         print(json.dumps({"ok": True, "file": path,
-                          "lines": [{"line": ln, "anchor": "%d#%s" % (ln, h), "text": t}
-                                    for (ln, h, t) in res["lines"]],
+                          "lines": [{"line": l.ln, "anchor": l.anchor, "text": l.text}
+                                    for l in res["lines"]],
+                          "hits": res["hits"], "windows": res["windows"],
+                          "query": res["query"],
                           "truncated": res["truncated"],
                           "next_offset": res["next_offset"],
                           "total_lines": res["total_lines"]}))
     else:
         for ln in res["payload"]:
             print(ln)
+        if not res["payload"] and (args.pattern is not None or args.grep is not None):
+            print("# no matches", file=sys.stderr)
         if res["truncated"]:
             print("# ... truncated (next offset %d)" % res["next_offset"],
                   file=sys.stderr)
@@ -420,9 +624,12 @@ def _write_cmd(parser, args, op):
                              before=getattr(args, "before", False), preview=preview)
             else:
                 parser.error("unknown op")
+    except UsageError as e:
+        print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
+        return 2
     except Exception as e:
         print(json.dumps({"ok": False, "error": "io", "message": str(e)}))
-        return 2 if isinstance(e, (ValueError, TypeError)) else 1
+        return 1
     if preview:
         if as_json:
             print(json.dumps(res))
@@ -663,6 +870,72 @@ def _selftest():
     with open(p) as f:
         check("CLI preview wrote nothing", f.read() == "one\ntwo\n")
 
+    # --- read_file: pattern regex, hits/windows, ReadResult self-rendering ---
+    _ow(p, "import os\ndef alpha():\n    return 1\n\nx = 10\ny = 20\ndef beta():\n    return 2\n\n")
+    r1 = read_file(p, pattern=r"^def ")
+    check("pattern hits", r1["hits"] == [2, 7])
+    check("pattern no context = hit lines", [l.ln for l in r1["lines"]] == [2, 7])
+    check("grep literal still works", read_file(p, grep="def")["hits"] == [2, 7])
+    r2 = read_file(p, pattern=r"^def ", context=1)
+    check("context windows skip gap", r2["windows"] == [(1, 3), (6, 8)])
+    check("touching windows merge", read_file(p, pattern=r"^def ", context=2)["windows"] == [(1, 9)])
+    check("str(ReadResult) = payload", str(r2) == "\n".join(r2["payload"]))
+    check("ReadResult is dict", isinstance(r2, dict) and r2["total_lines"] == 9)
+
+    # Line renders as a usable anchor, never just a hash
+    ln0 = r1["lines"][0]
+    check("Line repr is anchored",
+          repr(ln0) == str(ln0) == "%d#%s|%s" % (ln0.ln, ln0.digest, ln0.text))
+    check("Line.anchor composes", ln0.anchor == "%d#%s" % (ln0.ln, ln0.digest))
+    a, b, c = ln0
+    check("Line unpacks as tuple", (a, b, c) == (ln0.ln, ln0.digest, ln0.text))
+
+    # match()/window() composition
+    m2 = match(p, grep="def")
+    check("match fields", m2.path == p and m2.hits == [2, 7] and m2.query.startswith("grep="))
+    w2 = window(m2, before=1, after=1)
+    check("window merges", w2["windows"] == [(1, 3), (6, 8)])
+    check("window renders", str(w2) == "\n".join(w2["payload"]))
+
+    # no-match is explicit
+    rn = read_file(p, pattern=r"zzz_nope")
+    check("no match: empty hits/lines/windows",
+          rn["hits"] == [] and rn["lines"] == [] and rn["windows"] == [])
+    check("no match: not truncated, no next",
+          rn["truncated"] is False and rn["next_offset"] is None)
+    check("no match renders sentinel", str(rn) == "# no matches for pattern='zzz_nope'")
+
+    # res["query"] disambiguates "filter matched nothing" from "this was a page"
+    page = read_file(p, offset=1, limit=2)
+    check("page: query None, hits []", page["query"] is None and page["hits"] == [])
+    check("page: windows is the page range", page["windows"] == [(1, 2)])
+    check("filter: query set on no match", rn["query"] is not None)
+    check("query survives dict()/copy",
+          dict(rn).get("query") == rn["query"] and dict(page).get("query") is None)
+
+    # usage errors are UsageError (-> CLI "usage"), not generic errors
+    for name, fn in [
+        ("bad regex", lambda: read_file(p, pattern="(")),
+        ("both filters", lambda: read_file(p, pattern="x", grep="y")),
+        ("offset+filter", lambda: read_file(p, pattern="x", offset=1)),
+        ("context without filter", lambda: read_file(p, context=1)),
+        ("match needs one filter", lambda: match(p)),
+        ("match rejects both", lambda: match(p, pattern="x", grep="y")),
+        ("window negative before", lambda: window(match(p, grep="def"), before=-1)),
+        ("malformed anchor", lambda: replace(p, "ACA", ["x"])),
+    ]:
+        try:
+            fn()
+            check("UsageError: %s" % name, False)
+        except UsageError:
+            check("UsageError: %s" % name, True)
+
+    # a Line's anchor round-trips straight into an edit
+    rr = replace(p, ln0.anchor, ["# replaced"])
+    check("Line.anchor round-trips into replace", rr.get("ok") is True)
+    with open(p) as f:
+        check("Line.anchor replace content", f.read().split("\n")[1] == "# replaced")
+
     print("\n%s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
 
@@ -674,6 +947,7 @@ def main(argv: list[str] | None = None) -> int:
         epilog=("Examples:\n"
                 "  ./hedit.py read foo.py\n"
                 "  ./hedit.py read foo.py --grep def --context 2 --json\n"
+                "  ./hedit.py read foo.py --pattern 'def ' --context 2 --json\n"
                 "  printf 'new line\\n' | ./hedit.py replace foo.py 12#NKA -\n"
                 "  ./hedit.py replace foo.py 12#NKA 18#VRC --new-text 'a\\nb\\n'\n"
                 "  ./hedit.py insert foo.py 1#QVE --before --file header.txt\n"
@@ -690,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
     p_read.add_argument("--offset", type=int)
     p_read.add_argument("--limit", type=int)
     p_read.add_argument("--grep")
+    p_read.add_argument("--pattern")
     p_read.add_argument("--context", type=int)
     p_read.add_argument("--plain", action="store_true", help="no anchors")
     p_read.add_argument("--json", action="store_true")
