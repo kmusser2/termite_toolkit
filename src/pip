@@ -2,4 +2,4 @@
 # keywords: pip|install|package|python|dependencies|wrapper|modules
 # examples: TOOLKIT/pip install numpy | TOOLKIT/pip install -r requirements.txt | TOOLKIT/pip list
 # pip wrapper: sandbox env + writable cache (silences /nonexistent warning)
-exec /var/lib/llmchat-sandbox/TOOLKIT/envrun python3 -m pip "$@"
+exec "$(dirname "$0")/envrun" python3 -m pip "$@"

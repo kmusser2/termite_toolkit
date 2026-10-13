@@ -1,0 +1,19 @@
+{
+    "skills": [],
+    "tools": [
+        {
+            "init": "src/webfetch.py",
+            "files": [
+                "src/webfetch.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/websearch.py",
+            "files": [
+                "src/websearch.py"
+            ],
+            "root": false
+        }
+    ]
+}

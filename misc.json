@@ -1,0 +1,57 @@
+{
+    "skills": [],
+    "tools": [
+        {
+            "init": "src/table.py",
+            "files": [
+                "src/table.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/ansi.py",
+            "files": [
+                "src/ansi.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/pty_run.py",
+            "files": [
+                "src/pty_run.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/cronexpr.py",
+            "files": [
+                "src/cronexpr.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/healthcheck.py",
+            "files": [
+                "src/healthcheck.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/project_check.py",
+            "files": [
+                "src/project_check.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/envwrap.py",
+            "files": [
+                "src/envwrap.py",
+                "src/envrun",
+                "src/pip",
+                "src/permissions-check.sh"
+            ],
+            "root": false
+        }
+    ]
+}

@@ -1,0 +1,19 @@
+{
+    "skills": [],
+    "tools": [
+        {
+            "init": "src/clangd.py",
+            "files": [
+                "src/clangd.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/build.py",
+            "files": [
+                "src/build.py"
+            ],
+            "root": false
+        }
+    ]
+}

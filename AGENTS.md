@@ -33,7 +33,7 @@ uncommitted (`main`, no commits) and evolving.
 |------|-----------|-------|
 | `src/` | The toolkit: reusable tool modules | Auto-registered (see *Tool registry*) |
 | `TOOLKIT/` | Seeded **example** tools | `calculator.py`, `current_time.py`, `get_weather.py`; git-ignored |
-| `docs/` | Long-form documentation (**empty**) | Prose that doesn't belong in a docstring |
+| `docs/` | Long-form documentation | `docs/CAPABILITIES.md` (capability manifest schema & rules) |
 | `tests/` | Test scaffolding (**empty**) | Prefer per-module `--selftest` (see *Validating*) |
 | `tmp/` | Scratch space | Ephemeral, throwaway; never commit it |
 | `pyproject.toml` | Project metadata | `name = "Termite-Toolkit"`, `version = "0.1.0"`, `requires-python = ">=3.11"` |
@@ -50,6 +50,10 @@ The filesystem **is** the registry: any `.py` file whose first 15 lines contain
 
 - Discover: `list_tools`
 - Full usage (signatures, TypedDicts, examples): `get_tool(<name>)`
+
+Capability manifests (`workspace.json`, `network.json`, `cpp.json`, `misc.json`
+at the repo root) partition the tools; their schema and rules are documented
+in `docs/CAPABILITIES.md`.
 
 ## Authoring a new tool
 
@@ -126,6 +130,9 @@ Use the wrappers so tools find a writable `HOME`, pip cache, and git config:
 
 `src/permissions-check.sh` (run after granting permissions) verifies sandbox
 access to the paths the tools need.
+
+These shell helpers ship as payload behind the Python entry `src/envwrap.py`
+(capability manifest `misc.json`); `import envwrap` or `./envwrap.py --selftest`.
 
 ## Conventions
 

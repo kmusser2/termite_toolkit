@@ -1,0 +1,40 @@
+{
+    "skills": [],
+    "tools": [
+        {
+            "init": "src/symmap.py",
+            "files": [
+                "src/symmap.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/hedit.py",
+            "files": [
+                "src/hedit.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/fedit.py",
+            "files": [
+                "src/fedit.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/fio.py",
+            "files": [
+                "src/fio.py"
+            ],
+            "root": false
+        },
+        {
+            "init": "src/diffside.py",
+            "files": [
+                "src/diffside.py"
+            ],
+            "root": false
+        }
+    ]
+}
