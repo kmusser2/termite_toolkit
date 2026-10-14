@@ -23,8 +23,21 @@ import subprocess
 import sys
 import time
 
+from enum import StrEnum
+from typing import TypedDict
+
+import fio
 from table import render_table
-from typing import Any, TypedDict
+
+
+class Status(StrEnum):
+    """One check outcome; the value is the stored/wire form."""
+    PASS = "PASS"
+    FAIL = "FAIL"
+    NOT_RUN = "NOT_RUN"
+    SKIPPED = "SKIPPED"
+    BLOCKED = "BLOCKED"
+    STALE = "STALE"
 
 
 class CheckSpec(TypedDict, total=False):
@@ -47,7 +60,7 @@ class TestCounts(TypedDict):
 class CheckResult(TypedDict, total=False):
     """The result dict produced by run_check."""
     name: str
-    status: str
+    status: Status
     duration_ms: int
     command: str
     summary: str
@@ -74,21 +87,28 @@ class Report(TypedDict, total=False):
     timestamp: str
     results: list[CheckResult]
     counts: Counts
-    status: str
+    status: Status
 
+
+__all__ = ["CheckSpec", "CheckResult", "Counts", "Report", "Status",
+           "TestCounts", "assess", "format_duration", "report_status",
+           "render_report", "render_table_for_report", "run_check",
+           "run_configured_check", "selftest", "main"]
 
 BASE = Path(__file__).resolve().parent.parent
 DEFAULT_TIMEOUT = 120
 MAX_OUTPUT = 4000
 
 
-def atomic_json(path: str, value: Any) -> None:
-    """Write value to path as pretty JSON atomically (.new + os.replace), creating parent dirs."""
+def atomic_json(path: str, value: object) -> None:
+    """Write value to path as pretty JSON atomically, creating parent dirs.
+
+    The replace mechanism is fio.atomic_write's (its contract); this adds the
+    JSON encoding and parent-dir creation.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.new')
-    tmp.write_text(json.dumps(value, indent=2) + '\n')
-    os.replace(tmp, path)
+    fio.atomic_write(str(path), json.dumps(value, indent=2) + '\n')
 
 
 def find_manifest(root: str | None = None, manifest: str | None = None) -> Path:
@@ -111,7 +131,7 @@ def run_check(check: CheckSpec, cwd: str) -> CheckResult:
     name = check.get('name', 'unnamed')
     command = check.get('command')
     if not command:
-        return {'name': name, 'status': 'STALE', 'summary': 'missing command'}
+        return {'name': name, 'status': Status.STALE, 'summary': 'missing command'}
     timeout = float(check.get('timeout_sec', DEFAULT_TIMEOUT))
     expected = int(check.get('expected_exit', 0))
     started = time.monotonic()
@@ -119,7 +139,7 @@ def run_check(check: CheckSpec, cwd: str) -> CheckResult:
     try:
         proc = subprocess.run(command, shell=True, cwd=cwd, text=True,
                               capture_output=True, timeout=timeout)
-        status = 'PASS' if proc.returncode == expected else 'FAIL'
+        status = Status.PASS if proc.returncode == expected else Status.FAIL
         output = (proc.stdout + proc.stderr).strip()
         summary = f'exit {proc.returncode}'
         match = re.search(r'SELFTEST_RESULT\s+total=(\d+)\s+passed=(\d+)\s+failed=(\d+)', output)
@@ -128,10 +148,10 @@ def run_check(check: CheckSpec, cwd: str) -> CheckResult:
             result_tests = {'total': total, 'passed': passed, 'failed': failed}
             summary = f'exit {proc.returncode} | {total} tests | {passed} passed | {failed} failed'
     except subprocess.TimeoutExpired as exc:
-        status, output, summary = 'FAIL', ((exc.stdout or '') if isinstance(exc.stdout, str) else ''), f'timeout after {timeout:g}s'
+        status, output, summary = Status.FAIL, ((exc.stdout or '') if isinstance(exc.stdout, str) else ''), f'timeout after {timeout:g}s'
         proc = None
     except OSError as exc:
-        status, output, summary = 'BLOCKED', '', str(exc)
+        status, output, summary = Status.BLOCKED, '', str(exc)
         proc = None
     duration = round((time.monotonic() - started) * 1000)
     result = {'name': name, 'status': status, 'duration_ms': duration,
@@ -145,9 +165,10 @@ def run_check(check: CheckSpec, cwd: str) -> CheckResult:
     return result
 
 
-def report_status(counts: Counts) -> str:
-    """Overall status string: PASS unless any FAIL/BLOCKED/STALE count is nonzero."""
-    return 'PASS' if all(counts.get(s, 0) == 0 for s in ('FAIL', 'BLOCKED', 'STALE')) else 'FAIL'
+def report_status(counts: Counts) -> Status:
+    """Overall status: PASS unless any FAIL/BLOCKED/STALE count is nonzero."""
+    bad = (Status.FAIL, Status.BLOCKED, Status.STALE)
+    return Status.PASS if all(counts.get(s, 0) == 0 for s in bad) else Status.FAIL
 
 
 def format_duration(ms: int | float) -> str:
@@ -215,14 +236,13 @@ def assess(manifest_path: str | Path, out: str | None = None, quiet: bool = Fals
     for check in data.get('checks', []):
         results.extend(run_configured_check(check, project_root))
     if not results:
-        results = [{'name': 'manifest', 'status': 'STALE', 'summary': 'no checks configured'}]
-    counts = {s: sum(r['status'] == s for r in results)
-              for s in ('PASS', 'FAIL', 'NOT_RUN', 'SKIPPED', 'BLOCKED', 'STALE')}
+        results = [{'name': 'manifest', 'status': Status.STALE, 'summary': 'no checks configured'}]
+    counts = {s: sum(r['status'] == s for r in results) for s in Status}
     report = {'project': data.get('project', project_root.name),
               'manifest': str(manifest_path), 'root': str(project_root),
               'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
               'results': results, 'counts': counts,
-              'status': 'PASS' if all(r['status'] == 'PASS' for r in results) else 'FAIL'}
+              'status': Status.PASS if all(r['status'] == Status.PASS for r in results) else Status.FAIL}
     if out:
         atomic_json(out, report)
     if not quiet:
@@ -232,8 +252,8 @@ def assess(manifest_path: str | Path, out: str | None = None, quiet: bool = Fals
     passed = counts['PASS']
     failed = counts['FAIL']
     print(f"project-check: {len(results)} total | {passed} passed | {failed} failed" +
-          ('' if report['status'] == 'PASS' else '  NOT HEALTHY'))
-    return 0 if report['status'] == 'PASS' else 1
+          ('' if report['status'] == Status.PASS else '  NOT HEALTHY'))
+    return 0 if report['status'] == Status.PASS else 1
 
 
 def render_report(path: str | Path, color: bool = True) -> int:
@@ -241,12 +261,12 @@ def render_report(path: str | Path, color: bool = True) -> int:
     report = json.loads(Path(path).read_text())
     print(render_table_for_report(report, color=color))
     results = report.get('results', [])
-    passed = sum(1 for r in results if r.get('status') == 'PASS')
-    failed = sum(1 for r in results if r.get('status') == 'FAIL')
+    passed = sum(1 for r in results if r.get('status') == Status.PASS)
+    failed = sum(1 for r in results if r.get('status') == Status.FAIL)
     status = report.get('status')
     print(f'project-check: {len(results)} total | {passed} passed | {failed} failed' +
-          ('' if status == 'PASS' else '  NOT HEALTHY'))
-    return 0 if status == 'PASS' else 1
+          ('' if status == Status.PASS else '  NOT HEALTHY'))
+    return 0 if status == Status.PASS else 1
 
 
 def selftest() -> int:

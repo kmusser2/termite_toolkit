@@ -19,6 +19,8 @@ import os
 import subprocess
 import sys
 
+__all__ = ["resolve", "build", "syntax_check", "selftest", "main"]
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # workspace root (this file lives in <root>/src/)
 SELF = os.path.abspath(__file__)  # this module, for CLI self-invocation in the selftest
 
@@ -40,32 +42,13 @@ def _intermediates(src, out):
     return sorted(names)
 
 
-def build(compiler: str, std: str, src: str, out: str | None = None, syntax: bool = False) -> int:
-    """Compile src with the given compiler/std to out (or a default name); with syntax=True do a syntax check only. Returns the compiler exit code."""
+def build(compiler: str, std: str, src: str, out: str | None = None) -> int:
+    """Compile src with the given compiler/std to out (or a default name, the source without its extension). Returns the compiler exit code."""
     if not out:
         out = os.path.splitext(src)[0]
-    if syntax:
-        # Sandbox gotcha: opening /dev/null for WRITING is denied (Errno 13) for
-        # all processes, and gcc -fsyntax-only always targets /dev/null -> cannot
-        # use it. Compile to a throwaway .o in tmp/ instead, then delete it.
-        import tempfile
-        fd, tmpobj = tempfile.mkstemp(suffix='.o', dir=os.path.join(BASE, 'tmp'))
-        os.close(fd)
-        os.remove(tmpobj)
-        cmd = [compiler, f'-std={std}', '-c', '-Wall', '-Wextra', src, '-o', tmpobj]
-        print('+', ' '.join(cmd))
-        r = subprocess.run(cmd)
-        try:
-            os.remove(tmpobj)
-        except OSError:
-            pass
-        if r.returncode == 0:
-            print(f'OK syntax check ({src})')
-        return r.returncode
-    # Sandbox note: opening an EXISTING file with O_TRUNC used to be denied
-    # (EACCES), which broke gcc's internal temp handling; -save-temps makes
-    # intermediates explicit and sidesteps that. The deny was lifted
-    # 2026-08-16, but -save-temps stays as a harmless robust fallback.
+    # ponytail: -save-temps kept as a robust fallback though the sandbox
+    # O_TRUNC deny was lifted 2026-08-16; drop it once gcc temp handling is
+    # re-verified in the sandbox
     # Stale intermediates are removed first so gcc never re-opens them.
     for p in _intermediates(src, out):
         if os.path.exists(p):
@@ -78,6 +61,27 @@ def build(compiler: str, std: str, src: str, out: str | None = None, syntax: boo
             if os.path.exists(p):
                 os.remove(p)
         print(f'OK -> {out} ({os.path.getsize(out):,} bytes)')
+    return r.returncode
+
+
+def syntax_check(compiler: str, std: str, src: str) -> int:
+    """Check that src compiles, producing no binary. Returns the compiler exit code."""
+    # ponytail: compile to a throwaway .o in tmp/ instead of gcc -fsyntax-only,
+    # because the sandbox denies opening /dev/null for writing (Errno 13);
+    # switch to -fsyntax-only if that deny is ever lifted
+    import tempfile
+    fd, tmpobj = tempfile.mkstemp(suffix='.o', dir=os.path.join(BASE, 'tmp'))
+    os.close(fd)
+    os.remove(tmpobj)
+    cmd = [compiler, f'-std={std}', '-c', '-Wall', '-Wextra', src, '-o', tmpobj]
+    print('+', ' '.join(cmd))
+    r = subprocess.run(cmd)
+    try:
+        os.remove(tmpobj)
+    except OSError:
+        pass
+    if r.returncode == 0:
+        print(f'OK syntax check ({src})')
     return r.returncode
 
 
@@ -97,6 +101,10 @@ def selftest() -> int:
     d = tempfile.mkdtemp(dir=os.path.join(BASE, 'tmp'))
     try:
         check('resolve relative', resolve('tmp') == os.path.join(BASE, 'tmp'))
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            passed = main(['-h']) == 0
+        check('main(argv) honors argv', passed)
         check('resolve absolute passthrough', resolve('/abs/x') == '/abs/x')
         check('intermediates include .s', '/d/a.s' in _intermediates('/d/a.cpp', '/d/a'))
 
@@ -131,12 +139,12 @@ def selftest() -> int:
         rp = subprocess.run([cout], capture_output=True, text=True)
         check('c binary runs', rp.stdout.strip() == 'c-ok')
 
-        r = build('g++', 'c++17', src, syntax=True)
+        r = syntax_check('g++', 'c++17', src)
         check('syntax check ok', r == 0)
         bad = os.path.join(d, 'bad.cpp')
         with open(bad, 'w') as f:
             f.write('int main( { oops }\n')
-        r = build('g++', 'c++17', bad, syntax=True)
+        r = syntax_check('g++', 'c++17', bad)
         check('syntax error detected', r != 0)
         r = build('g++', 'c++17', os.path.join(d, 'missing.cpp'), out)
         check('missing source -> nonzero', r != 0)
@@ -172,7 +180,6 @@ def selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point (see the module docstring for usage)."""
     args = sys.argv[1:] if argv is None else list(argv)
-    args = sys.argv[1:]
     if not args or args[0] in ('-h', '--help', 'help'):
         print(__doc__)
         return 0 if args else 1
@@ -191,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == 'check':
         if not rest:
             print('usage: build.py check <source.cpp>'); return 1
-        return build('g++', 'c++17', resolve(rest[0]), syntax=True)
+        return syntax_check('g++', 'c++17', resolve(rest[0]))
     if cmd == 'run':
         if not rest:
             print('usage: build.py run <binary> [args...]'); return 1

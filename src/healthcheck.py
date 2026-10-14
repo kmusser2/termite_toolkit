@@ -18,8 +18,21 @@ from __future__ import annotations
 import argparse, glob, os, resource, shutil, socket, subprocess, sys, tempfile, time
 from typing import Sequence
 
-SB = "/var/lib/llmchat-sandbox"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))  # tool modules live beside this file
+BASE = os.path.dirname(TOOLS_DIR)                       # workspace root (contains src/ and tmp/)
+SCRATCH = os.path.join(BASE, "tmp")                     # probe artifacts go here (per AGENTS.md)
+
+__all__ = ["run", "scratch", "selftest_self", "main"]
+
+
+def scratch() -> str:
+    """Writable scratch dir for probe artifacts (BASE/tmp), created on demand.
+
+    Raises OSError when the workspace offers no writable tmp/ -- probe callers
+    turn that into a failed check rather than letting the run crash."""
+    os.makedirs(SCRATCH, exist_ok=True)
+    return SCRATCH
+
 
 def run(cmd: Sequence[str], timeout: float = 30, input: str | None = None) -> tuple[int | None, str]:
     """Run a shell command capturing output; return (returncode, trimmed output or 'TIMEOUT')."""
@@ -62,14 +75,19 @@ def probe_toolchains(c: Check) -> None:
         "gcc":      (".c",   '#include <stdio.h>\nint main(){{puts("ok");return 0;}}\n'),
         "g++":      (".cpp", '#include <iostream>\nint main(){{std::cout<<"ok\\n";}}\n'),
     }
-    for cc, (ext, src) in compiles.items():
-        t = tempfile.NamedTemporaryFile("w", suffix=ext, delete=False, dir=SB+"/tmp"); t.write(src); t.close()
-        exe = t.name + ".out"
-        rc1, _ = run(f"{cc} {t.name} -o {exe} && {exe}", timeout=30)
-        c.add(f"toolchain {cc} compile+run", rc1 == 0)
-        for f in (t.name, exe):
-            try: os.unlink(f)
-            except OSError: pass
+    try:
+        tmpdir = scratch()
+        for cc, (ext, src) in compiles.items():
+            t = tempfile.NamedTemporaryFile("w", suffix=ext, delete=False, dir=tmpdir)
+            t.write(src); t.close()
+            exe = t.name + ".out"
+            rc1, _ = run(f"{cc} {t.name} -o {exe} && {exe}", timeout=30)
+            c.add(f"toolchain {cc} compile+run", rc1 == 0)
+            for f in (t.name, exe):
+                try: os.unlink(f)
+                except OSError: pass
+    except OSError as exc:
+        c.add("toolchain compile+run", False, "no writable scratch: %s" % exc)
     for t in ["make", "cmake", "python3", "java", "javac", "node", "git", "curl"]:
         rc, out = run(f"command -v {t} >/dev/null && {t} --version 2>&1 | head -1", timeout=15)
         c.add(f"toolchain {t}", rc == 0, out[:60])
@@ -84,10 +102,16 @@ def probe_network(c: Check) -> None:
 
 def probe_symlink_venv(c: Check) -> None:
     """Probe symlink(2) support and that python3 -m venv works end-to-end."""
-    t = SB + "/tmp/hc_sl"
+    try:
+        tmpdir = scratch()
+    except OSError as exc:
+        c.add("symlink(2)", False, "no writable scratch: %s" % exc)
+        c.add("python3 -m venv (e2e)", False, "no writable scratch: %s" % exc)
+        return
+    t = os.path.join(tmpdir, "hc_sl")
     rc, out = run(f"python3 -c \"import os; os.symlink('/etc/hosts', '{t}'); os.unlink('{t}')\"", timeout=15)
     c.add("symlink(2)", rc == 0, out[-80:])
-    v = SB + "/tmp/hc_venv"
+    v = os.path.join(tmpdir, "hc_venv")
     rc, out = run(f"rm -rf {v} && python3 -m venv {v} && {v}/bin/python -c 'import sys; print(sys.prefix!=sys.base_prefix)'", timeout=60)
     ok = rc == 0 and out.endswith("True")
     c.add("python3 -m venv (e2e)", ok, out[-80:])
@@ -119,6 +143,8 @@ def selftest_self() -> int:
     c = Check(quiet=True); c.add("forced-fail-probe", False, "expected"); sys.argv = [sys.argv[0]]
     rc = c.done()
     assert rc == 1 and len(c.results) == 1 and not c.results[0][1]
+    s = scratch()
+    assert os.path.isdir(s) and os.path.commonpath([s, BASE]) == BASE, s
     print("healthcheck.py --selftest PASS (failure detection works)")
     return 0
 
@@ -133,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         return selftest_self()
     c = Check(quiet=a.quiet)
     t0 = time.time()
-    print(f"healthcheck for {SB}  ({time.strftime('%Y-%m-%d %H:%M:%S')})")
+    print(f"healthcheck for {BASE}  ({time.strftime('%Y-%m-%d %H:%M:%S')})")
     probe_toolchains(c)
     probe_devices(c)
     probe_network(c)

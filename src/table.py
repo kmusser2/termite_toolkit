@@ -3,13 +3,14 @@
 """table.py - ANSI-safe Unicode table renderer for terminal output."""
 # keywords: table|render|unicode|ansi|box|grid|column|display|terminal
 # examples: import table; table.render_table(["a", "b"], [["1", "2"]])|./table.py --selftest
-import re
 import shutil
 import sys
 import unicodedata
 from typing import Sequence
 
-ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+import ansi
+
+__all__ = ["display_width", "render_table", "selftest", "main"]
 
 # Status words get colored when `color=True`: PASS green, FAIL red,
 # BLOCKED yellow, STALE gray.
@@ -25,7 +26,7 @@ def display_width(value: object) -> int:  # ANSI sequences never count toward wi
     """Visible width of a value in terminal cells; ANSI escapes and combining chars count 0, wide/fullwidth chars count 2."""
     # Most toolkit output is ASCII/emoji/box-drawing; wcwidth is avoided to
     # keep this helper stdlib-only. ANSI sequences never count toward width.
-    text = ANSI.sub('', str(value))
+    text = ansi.strip_str(str(value))
     return sum(0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1) for ch in text)
 
 
@@ -36,7 +37,7 @@ def _pad(value, width):
 
 def _colorize_status(value):
     """Wrap a cell in ANSI color if its plain text is exactly a status word."""
-    plain = ANSI.sub('', str(value)).strip()
+    plain = ansi.strip_str(str(value)).strip()
     code = STATUS_COLORS.get(plain)
     return value if code is None else f'\033[{code}m{value}\033[0m'
 

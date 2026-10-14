@@ -27,11 +27,15 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
-from typing import Any, TypedDict
+from typing import TypedDict
 
 # --- sibling tools live in this directory (hedit supplies anchors) ----------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hedit  # noqa: E402
+
+
+__all__ = ["Backend", "ParseResult", "Symbol", "detect_lang", "parse",
+           "parse_source", "register_backend", "main"]
 
 
 class Symbol(TypedDict):
@@ -87,7 +91,7 @@ def _anchor(lines: Sequence[str], ln: int) -> str:
     return "%d#%s" % (ln, hedit.hash_line(text, ln))
 
 
-def _mk(node: Any, qn: str, kind: str, sig: str, lines: Sequence[str], is_async: bool) -> Symbol:
+def _mk(node: ast.AST, qn: str, kind: str, sig: str, lines: Sequence[str], is_async: bool) -> Symbol:
     return {
         "name": node.name, "qualified_name": qn, "kind": kind, "is_async": is_async,
         "start": node.lineno, "end": node.end_lineno, "signature": sig,
@@ -102,7 +106,7 @@ def _py_backend(source: str, path: str) -> list[Symbol]:
     lines = source.split("\n")
     out: list[Symbol] = []
 
-    def walk(node: Any, qual: str, in_class: bool) -> None:
+    def walk(node: ast.AST, qual: str, in_class: bool) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
                 bases = [ast.unparse(b) for b in child.bases]
@@ -255,7 +259,7 @@ def _selftest() -> int:
         check("line range 13-14", (fetch["start"], fetch["end"]) == (13, 14))
         check("anchor format LN#XXX", bool(re.match(r"^\d+#[A-Za-z0-9]{3}$", fetch["anchor"])))
         view = hedit.read_file(tmp, grep="async def fetch", context=0)
-        check("anchor agrees with hedit", any(fetch["anchor"] in ln for ln in view["payload"]))
+        check("anchor agrees with hedit", any(fetch["anchor"] in ln for ln in view.payload))
         svc = next(s for s in r["symbols"] if s["qualified_name"] == "Service")
         check("class signature + decorator", svc["signature"] == "class Service:" and svc["decorators"] == ["cache"])
         bad = parse_source("def broken(:\n", "x.py")

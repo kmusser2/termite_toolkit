@@ -39,6 +39,10 @@ import sys
 import time
 import shlex
 
+import ansi
+
+__all__ = ["encode_key", "parse_cmd", "selftest", "main"]
+
 # workspace root (this file lives in <root>/src/)
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -92,6 +96,11 @@ def selftest() -> int:
     check('key raw csi', encode_key(r'raw:\x1b[3~') == b'\x1b[3~')
     check('parse_cmd simple', parse_cmd('python3 /x/probe.py') == ['python3', '/x/probe.py'])
     check('parse_cmd quoted', parse_cmd('printf "a b"') == ['printf', 'a b'])
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        argv_ok = main(['-h']) == 0 and main(['--bogus']) == 1
+    check('main(argv) honors argv', argv_ok)
 
     try:
         m, s = pty.openpty()
@@ -187,7 +196,6 @@ def selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point (see the module docstring for usage)."""
     args = sys.argv[1:] if argv is None else list(argv)
-    args = sys.argv[1:]
     if args and args[0] == '--selftest':
         return selftest()
     opts = {
@@ -277,8 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         os.close(slave)
 
     if opts['strip']:
-        import re
-        total = re.sub(rb'\x1b\[[0-9;?]*[A-Za-z]', b'', total)
+        total = ansi.strip(total)
     text = total.decode('utf-8', errors='replace')
     if opts['lines']:
         text = '\n'.join(text.split('\n')[:opts['lines']])

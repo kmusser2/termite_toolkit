@@ -2,17 +2,17 @@
 # TYPE: TOOLKIT
 """webfetch.py - fetch pages; urlgrep() pulls the lines you need.
 # keywords: url|grep|fetch|web|http|html|markdown|text|download|page|content|curl|scrape|retrieve|get|distill|extract|filter|lines|regex|pattern|snippet|lookup|find|specific|section|token|efficient|context
-# examples: import webfetch; webfetch.urlgrep("https://openrouter.ai/docs/limits", ["limit_remaining"], max_lines=5) | import webfetch; webfetch.head("https://example.com") | import webfetch; webfetch.webfetch("https://example.com", format="markdown")
+# examples: import webfetch; webfetch.urlgrep("https://openrouter.ai/docs/limits", ["limit_remaining"], max_lines=5) | import webfetch; webfetch.head("https://example.com") | import webfetch; webfetch.fetch_markdown("https://example.com")
 
 Token-efficiency first: when you need something SPECIFIC from a page, call
 urlgrep() (fetch + filter in one call -- only matching lines enter context);
-call head() for a quick outline of the top of a page; call webfetch() only when
-you want the whole page.
+call head() for a quick outline of the top of a page; call fetch_markdown() /
+fetch_text() / fetch_html() only when you want the whole page.
 
   import webfetch
   webfetch.urlgrep(url, patterns, max_lines=10, width=150, ctx_before=0,
-                   ctx_after=0, case=True, format='text')
-  webfetch.head(url, n=20, width=150, format='markdown')
+                   ctx_after=0, case=True, format=webfetch.Format.TEXT)
+  webfetch.head(url, n=20, width=150)
 
 Fetches a URL and returns the content as Markdown (default), plain text, or
 raw HTML. Detects images and can save them. Stdlib-only (no pip deps).
@@ -40,10 +40,13 @@ Options:
 
 Python API:
   import webfetch
-  result = webfetch.webfetch("https://example.com", format="markdown")
+  result = webfetch.fetch_markdown("https://example.com")
   print(result["output"])
   webfetch.urlgrep("https://example.com/docs", ["timeout"], max_lines=5)
   webfetch.head("https://example.com")   # outline of the top (markdown)
+
+The parsed-HTML tree is also public: parse_html() -> Node, find_all() and
+text_of() query it without reaching into node internals.
 
 Notes / behavior (mirrors OpenCode webfetch):
   * URL must start with http:// or https://
@@ -64,12 +67,50 @@ import urllib.error
 import urllib.request
 import zlib
 from contextlib import contextmanager
+from enum import StrEnum
 from html.parser import HTMLParser
-from typing import Any, Sequence
+from typing import Sequence, TypedDict
 
 DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 120
 MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+class Format(StrEnum):
+    """The rendition a page is fetched in; the value is the wire form."""
+    MARKDOWN = "markdown"
+    TEXT = "text"
+    HTML = "html"
+
+
+class Attachment(TypedDict):
+    """One attachment of a fetched image (a data URL)."""
+    type: str
+    mime: str
+    url: str
+
+
+class WebResult(TypedDict, total=False):
+    """The fetch result: metadata plus 'output'; images also carry bytes,
+    'base64' and 'attachments'."""
+    url: str
+    final_url: str
+    status: int
+    content_type: str
+    format: Format
+    title: str
+    output: str
+    mime: str
+    size: int
+    data: bytes
+    base64: str
+    attachments: list[Attachment]
+
+
+__all__ = ["Format", "Attachment", "WebResult", "Node",
+           "urlgrep", "head", "fetch_markdown", "fetch_text", "fetch_html",
+           "parse_html", "find_all", "text_of",
+           "html_to_markdown", "html_to_text", "main"]
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -105,22 +146,22 @@ VOID_ELEMENTS = {"area", "base", "br", "col", "embed", "hr", "img", "input",
 # call and return only the lines you asked for. They are defined first so they
 # appear at the top of this tool's function list (list_tools / get_tool).
 
-def _fetch(url: str, format: str = "text") -> str:
-    """Fetch url and return its content as a string in the given format."""
-    return webfetch(url, format=format)["output"]
+def _fetch(url: str, format: Format = Format.TEXT) -> str:
+    """Fetch url and return its content as a string in the given rendition."""
+    return _webfetch(url, Format(format))["output"]
 
 
-def urlgrep(url: str, patterns: Sequence[str], max_lines: int = 10, width: int = 150, ctx_before: int = 0, ctx_after: int = 0, case: bool = True, format: str = "text") -> str:
+def urlgrep(url: str, patterns: Sequence[str], max_lines: int = 10, width: int = 150, ctx_before: int = 0, ctx_after: int = 0, case: bool = True, format: Format | str = Format.TEXT) -> str:
     """Fetch url, return only the lines matching any pattern (regex), truncated.
 
     Token-efficiency helper: keep just the lines you need. patterns are
     regexes; set case=False for case-insensitive matching. ctx_before/ctx_after
-    add neighbouring lines as context. format picks the source rendition:
-    'text' (default) is the clean match surface; 'markdown' keeps headings and
-    links; 'html' uses the raw markup.
+    add neighbouring lines as context. format tunes the match surface:
+    Format.TEXT (default) is the clean one; Format.MARKDOWN keeps headings and
+    links; Format.HTML matches against the raw markup.
     """
     rxs = [re.compile(p, 0 if case else re.IGNORECASE) for p in patterns]
-    lines = _fetch(url, format).splitlines()
+    lines = _fetch(url, Format(format)).splitlines()
     seen, out = set(), []
     for i, ln in enumerate(lines):
         if not any(rx.search(ln) for rx in rxs):
@@ -134,11 +175,11 @@ def urlgrep(url: str, patterns: Sequence[str], max_lines: int = 10, width: int =
     return "\n".join(out)
 
 
-def head(url: str, n: int = 20, width: int = 150, format: str = "markdown") -> str:
+def head(url: str, n: int = 20, width: int = 150, format: Format | str = Format.MARKDOWN) -> str:
     """Fetch url, return the first n non-empty lines (an outline), truncated.
 
-    A quick "what is on this page?" peek. Defaults to format='markdown' so the
-    heading/bullet structure stays visible; pass format='text' for plain text.
+    A quick "what is on this page?" peek. Defaults to Format.MARKDOWN so the
+    heading/bullet structure stays visible; pass Format.TEXT for plain text.
     Thin wrapper over urlgrep (pattern \\S = any line with real content).
     """
     return urlgrep(url, [r"\S"], max_lines=n, width=width, format=format)
@@ -148,20 +189,27 @@ def head(url: str, n: int = 20, width: int = 150, format: str = "markdown") -> s
 # Tiny DOM builder on top of html.parser
 # --------------------------------------------------------------------------
 
-class _Node:
+class Node:
+    """One node of a parsed HTML page (from parse_html()).
+
+    tag is the lower-case element name, or None for a text run; attrs is the
+    element's attribute map; children are this node's sub-nodes; text is the
+    text run's content. Query the tree through find_all() / text_of() rather
+    than walking children by hand.
+    """
     __slots__ = ("tag", "attrs", "children", "text")
 
-    def __init__(self, tag=None, attrs=None, text=""):
+    def __init__(self, tag: str | None = None, attrs: dict[str, str] | None = None, text: str = "") -> None:
         self.tag = tag          # None for text nodes
         self.attrs = attrs or {}
-        self.children = []
+        self.children: list[Node] = []
         self.text = text
 
 
 class _TreeBuilder(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.root = _Node(tag="#root")
+        self.root = Node(tag="#root")
         self.stack = [self.root]
         self.skip_depth = 0
 
@@ -171,14 +219,14 @@ class _TreeBuilder(HTMLParser):
             # Void elements have no closing tag; never push, never count skip.
             if self.skip_depth > 0 or tag in SKIP_TAGS:
                 return
-            node = _Node(tag=tag, attrs=dict(attrs))
+            node = Node(tag=tag, attrs=dict(attrs))
             self.stack[-1].children.append(node)
             return
         if self.skip_depth > 0 or tag in SKIP_TAGS:
             if tag in SKIP_TAGS:
                 self.skip_depth += 1
             return
-        node = _Node(tag=tag, attrs=dict(attrs))
+        node = Node(tag=tag, attrs=dict(attrs))
         self.stack[-1].children.append(node)
         self.stack.append(node)
 
@@ -186,7 +234,7 @@ class _TreeBuilder(HTMLParser):
         tag = tag.lower()
         if self.skip_depth > 0 or tag in SKIP_TAGS:
             return
-        node = _Node(tag=tag, attrs=dict(attrs))
+        node = Node(tag=tag, attrs=dict(attrs))
         self.stack[-1].children.append(node)
 
     def handle_endtag(self, tag):
@@ -202,15 +250,35 @@ class _TreeBuilder(HTMLParser):
 
     def handle_data(self, data):
         if self.skip_depth == 0 and self.stack:
-            self.stack[-1].children.append(_Node(text=data))
+            self.stack[-1].children.append(Node(text=data))
 
 
-def parse_html(html: str) -> _Node:
-    """Parse an HTML string into the internal _Node tree used by the converters."""
+def parse_html(html: str) -> Node:
+    """Parse an HTML string into a Node tree (the converters work on it too)."""
     builder = _TreeBuilder()
     builder.feed(html)
     builder.close()
     return builder.root
+
+
+def find_all(node: Node, tag: str | None = None, class_token: str | None = None) -> list[Node]:
+    """Every descendant of node matching tag and/or class_token (depth-first)."""
+    found: list[Node] = []
+    for child in node.children:
+        if child.tag is not None:
+            matches_tag = tag is None or child.tag == tag
+            matches_class = class_token is None or class_token in child.attrs.get("class", "").split()
+            if matches_tag and matches_class:
+                found.append(child)
+            found.extend(find_all(child, tag, class_token))
+    return found
+
+
+def text_of(node: Node) -> str:
+    """All text under node, concatenated without separators (single-line use)."""
+    if node.tag is None:
+        return node.text
+    return "".join(text_of(child) for child in node.children)
 
 
 # --------------------------------------------------------------------------
@@ -462,15 +530,35 @@ def _ipv4_first():
         socket.getaddrinfo = original
 
 
-def webfetch(url: str, format: str = "markdown", timeout: float = DEFAULT_TIMEOUT, max_size: int = MAX_RESPONSE_SIZE, headers: dict[str, str] | None = None, verbose: bool = False) -> dict[str, Any]:
-    """Fetch a URL and return a dict with 'output' (and metadata).
+def fetch_markdown(url: str, timeout: float = DEFAULT_TIMEOUT, max_size: int = MAX_RESPONSE_SIZE, headers: dict[str, str] | None = None, verbose: bool = False) -> WebResult:
+    """Fetch a URL and return its content rendered as Markdown (with metadata).
 
     Raises ValueError on bad args, RuntimeError on fetch/limit errors.
     """
+    return _webfetch(url, Format.MARKDOWN, timeout, max_size, headers, verbose)
+
+
+def fetch_text(url: str, timeout: float = DEFAULT_TIMEOUT, max_size: int = MAX_RESPONSE_SIZE, headers: dict[str, str] | None = None, verbose: bool = False) -> WebResult:
+    """Fetch a URL and return its content as plain text (with metadata).
+
+    Raises ValueError on bad args, RuntimeError on fetch/limit errors.
+    """
+    return _webfetch(url, Format.TEXT, timeout, max_size, headers, verbose)
+
+
+def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT, max_size: int = MAX_RESPONSE_SIZE, headers: dict[str, str] | None = None, verbose: bool = False) -> WebResult:
+    """Fetch a URL and return its content as raw HTML (with metadata).
+
+    Raises ValueError on bad args, RuntimeError on fetch/limit errors.
+    """
+    return _webfetch(url, Format.HTML, timeout, max_size, headers, verbose)
+
+
+def _webfetch(url: str, format: Format, timeout: float = DEFAULT_TIMEOUT, max_size: int = MAX_RESPONSE_SIZE, headers: dict[str, str] | None = None, verbose: bool = False) -> WebResult:
+    """One fetch rendered as `format`; the public fetch_* verbs wrap this."""
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError("URL must start with http:// or https://")
-    if format not in ("text", "markdown", "html"):
-        raise ValueError("format must be 'text', 'markdown', or 'html'")
+    format = Format(format)
 
     timeout = min(max(int(timeout or 0), 0), MAX_TIMEOUT)
     if timeout == 0:
@@ -558,8 +646,8 @@ def webfetch(url: str, format: str = "markdown", timeout: float = DEFAULT_TIMEOU
             "content_type": content_type, "format": format, "title": title,
             "output": "Image fetched successfully", "mime": mime,
             "size": len(data), "data": data, "base64": b64,
-            "attachments": [{"type": "file", "mime": mime,
-                             "url": "data:%s;base64,%s" % (mime, b64)}],
+            "attachments": [Attachment(type="file", mime=mime,
+                                       url="data:%s;base64,%s" % (mime, b64))],
         }
 
     content = data.decode("utf-8", errors="replace")
@@ -592,10 +680,14 @@ def _selftest():
 
     # 1. URL validation
     try:
-        webfetch("ftp://example.com", timeout=1)
+        fetch_text("ftp://example.com", timeout=1)
         check("URL scheme validation", False)
     except ValueError:
         check("URL scheme validation", True)
+
+    check("Format values are the wire strings",
+          [f.value for f in Format] == ["markdown", "text", "html"])
+    check("Format coerces plain strings", Format("html") is Format.HTML)
 
     # 2. Markdown conversion
     html = ("<html><head><title>x</title><style>body{}</style></head><body>"
@@ -618,6 +710,12 @@ def _selftest():
     check("text has content", "Hello" in txt and "bold" in txt)
     check("text skips script", "evil()" not in txt)
 
+    # 3b. Public node queries
+    tree = parse_html("<div class='r'><a href='/x'>go</a></div><div>no</div>")
+    check("find_all by tag+class", len(find_all(tree, "div", "r")) == 1)
+    check("find_all by tag", len(find_all(tree, "div")) == 2)
+    check("text_of concatenates", text_of(find_all(tree, "a")[0]) == "go")
+
     # 4. Table conversion
     tbl = html_to_markdown("<table><tr><th>A</th><th>B</th></tr>"
                            "<tr><td>1</td><td>2</td></tr></table>")
@@ -627,7 +725,7 @@ def _selftest():
     fake = ("line one credit\nline two other\nline three CREDIT again\n"
             "line four\n")
     orig_fetch = globals()["_fetch"]
-    globals()["_fetch"] = lambda url, format="text": fake
+    globals()["_fetch"] = lambda url, format=Format.TEXT: fake
     try:
         r = urlgrep("x", ["credit"])
         check("urlgrep returns only matching lines",
@@ -736,11 +834,14 @@ def main(argv: list[str] | None = None) -> int:
             print(text)
         return 0
 
+    fmt = Format(args.format) if args.format else Format.MARKDOWN
+    fetcher = {Format.MARKDOWN: fetch_markdown,
+               Format.TEXT: fetch_text,
+               Format.HTML: fetch_html}[fmt]
     try:
-        result = webfetch(args.url, format=args.format or "markdown",
-                          timeout=args.timeout,
-                          max_size=args.max_size, headers=headers,
-                          verbose=args.verbose)
+        result = fetcher(args.url, timeout=args.timeout,
+                         max_size=args.max_size, headers=headers,
+                         verbose=args.verbose)
     except Exception as e:
         print("webfetch: error: %s" % e, file=sys.stderr)
         return 1

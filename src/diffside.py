@@ -46,6 +46,10 @@ import shutil
 import sys
 from typing import Sequence
 
+import ansi
+
+__all__ = ["files", "from_unified", "html", "html_files", "selftest", "main"]
+
 RED = "\x1b[31m"
 GREEN = "\x1b[32m"
 BOLD = "\x1b[1m"
@@ -58,15 +62,13 @@ DEFAULT_WIDTH = 60          # per-column cap when the terminal width is unknown
 _MIN_COL = 6                # smallest a column may be (headers need ~5)
 ELL = "\u2026"
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
 
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
 
 def _vis(s):
-    return len(_ANSI_RE.sub("", s))
+    return len(ansi.strip_str(s))
 
 
 def _truncate(s, w):
@@ -164,14 +166,14 @@ def _pair(hunk_lines):
             while i < n and hunk_lines[i][0] == "add":
                 adds.append(hunk_lines[i][1]); i += 1
             for k in range(max(len(dels), len(adds))):
-                l = dels[k] if k < len(dels) else ""
-                r = adds[k] if k < len(adds) else ""
-                if l and not r:
-                    rows.append(("del", l))
-                elif r and not l:
-                    rows.append(("add", r))
+                left = dels[k] if k < len(dels) else ""
+                right = adds[k] if k < len(adds) else ""
+                if left and not right:
+                    rows.append(("del", left))
+                elif right and not left:
+                    rows.append(("add", right))
                 else:
-                    rows.append(("repl", l, r))
+                    rows.append(("repl", left, right))
         else:
             while i < n and hunk_lines[i][0] == "add":
                 rows.append(("add", hunk_lines[i][1])); i += 1
@@ -239,10 +241,10 @@ def _rows_for_files(old_lines, new_lines, old_name="", new_name=""):
                 rows.append(("row", "  ", "", None, "+ ", new_lines[k], GREEN))
         elif tag == "replace":
             for k in range(max(i2 - i1, j2 - j1)):
-                l = old_lines[i1 + k] if k < i2 - i1 else ""
-                r = new_lines[j1 + k] if k < j2 - j1 else ""
-                rows.append(("row", "- " if l else "  ", l, RED if l else None,
-                             "+ " if r else "  ", r, GREEN if r else None))
+                left = old_lines[i1 + k] if k < i2 - i1 else ""
+                right = new_lines[j1 + k] if k < j2 - j1 else ""
+                rows.append(("row", "- " if left else "  ", left, RED if left else None,
+                             "+ " if right else "  ", right, GREEN if right else None))
     return title, rows
 
 
@@ -315,13 +317,13 @@ def _render(rows, title, width, sep, color, box):
     for row in rows:
         k = row[0]
         if k == "row":
-            l = _cell(row[2], row[1], row[3], lw, color)
-            r = _cell(row[5], row[4], row[6], rw, color)
-            out.append(_box_row(l, r, lw, rw, color) if box else l + sep + r)
+            left = _cell(row[2], row[1], row[3], lw, color)
+            right = _cell(row[5], row[4], row[6], rw, color)
+            out.append(_box_row(left, right, lw, rw, color) if box else left + sep + right)
         elif k == "hdr":
-            l = _cell(row[1], "  ", BOLD, lw, color)
-            r = _cell(row[2], "  ", BOLD, rw, color)
-            out.append(_box_row(l, r, lw, rw, color) if box else l + sep + r)
+            left = _cell(row[1], "  ", BOLD, lw, color)
+            right = _cell(row[2], "  ", BOLD, rw, color)
+            out.append(_box_row(left, right, lw, rw, color) if box else left + sep + right)
         elif k in ("badge", "full"):
             line = ((DIM if k == "badge" else BOLD) if color else "") + \
                    row[1] + (RESET if color else "")
@@ -368,12 +370,12 @@ def _html_page(rows, title, width, sep):
         elif k == "sep":
             p.append("<tr><td colspan='3'>&nbsp;</td></tr>")
         else:
-            l = _pad(_truncate(row[1] + row[2], lw), lw)
-            r = _pad(_truncate(row[4] + row[5], rw), rw)
+            left = _pad(_truncate(row[1] + row[2], lw), lw)
+            right = _pad(_truncate(row[4] + row[5], rw), rw)
             cls_l = " class='del'" if row[3] else ""
             cls_r = " class='add'" if row[6] else ""
             p.append("<tr><td%s>%s</td><td class='gap'>%s</td><td%s>%s</td></tr>"
-                     % (cls_l, esc(l), esc(sep), cls_r, esc(r)))
+                     % (cls_l, esc(left), esc(sep), cls_r, esc(right)))
     p.append("</table></body></html>")
     return "\n".join(p)
 
@@ -522,7 +524,7 @@ def _selftest():
      main()
 '''
     rows = from_unified(diff, width=60)
-    check("hedit box title", "tmp/greet_demo.py" in rows[0] and _ANSI_RE.sub("", rows[0]).endswith("─╮"), True)
+    check("hedit box title", "tmp/greet_demo.py" in rows[0] and ansi.strip_str(rows[0]).endswith("─╮"), True)
     check("hedit badge", any("@@ -1,16 +1,19 @@" in r for r in rows), True)
     check("hedit paired", any("- def greet(name, times=1)" in r and
                               "+ def greet(name, times=1, shout" in r for r in rows), True)

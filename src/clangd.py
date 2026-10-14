@@ -118,6 +118,8 @@ import json
 import os
 import pathlib
 import re
+import queue
+import select
 import shutil
 import signal
 import socket
@@ -126,8 +128,14 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from enum import StrEnum
 from typing import TypedDict
 from urllib.parse import quote, unquote, urlparse
+
+__all__ = ["ClangdError", "Diagnostic", "Hover", "Location", "CheckSummary",
+           "DbHealth", "InstanceInfo", "SupervisorStatus", "Severity",
+           "available", "check", "close", "compile_db_health", "definition",
+           "diagnostics", "hover", "references", "status", "main"]
 
 # Defaults; every one can be overridden through the environment (see above).
 DEFAULT_IDLE = 600.0
@@ -137,8 +145,17 @@ DEFAULT_SETTLE = 0.4
 DEFAULT_TIMEOUT = 90.0
 _MIN_CLANGD_MAJOR = 12   # oldest clangd whose LSP this tool understands
 
-_SEVERITY_RANK = {"error": 1, "warning": 2, "info": 3, "hint": 4}
-_SEVERITY_NAME = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+class Severity(StrEnum):
+    """A diagnostic severity; the value is the public/wire form."""
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+    HINT = "hint"
+
+
+# rank 1 is the most severe (LSP's numbering); the dict keys are the set members
+_SEVERITY_RANK = {Severity.ERROR: 1, Severity.WARNING: 2, Severity.INFO: 3, Severity.HINT: 4}
+_SEVERITY_NAME = {1: Severity.ERROR, 2: Severity.WARNING, 3: Severity.INFO, 4: Severity.HINT}
 
 
 class ClangdError(RuntimeError):
@@ -152,7 +169,7 @@ class ClangdError(RuntimeError):
     caller only ever sees the final, already-retried error."""
 
 
-class _SupervisorGone(ClangdError):
+class _SupervisorGoneError(ClangdError):
     """The supervisor socket died mid-request; the client restarts it and retries."""
 
 
@@ -170,7 +187,7 @@ class Diagnostic(TypedDict):
     col: int
     end_line: int
     end_col: int
-    severity: str        # "error" | "warning" | "info" | "hint"
+    severity: Severity
     code: str            # clangd diagnostic code, "" when absent
     message: str         # first line only
 
@@ -260,7 +277,22 @@ def _scratch_root() -> str:
 
 
 def _uid_dir() -> str:
-    return os.path.join(_scratch_root(), "uid-%d" % os.getuid())
+    """This uid's private tree inside the session-shared scratch root.
+
+    The root is shared by every uid using the session scratch, so it stays
+    01777: each uid creates its own uid-<uid> tree inside (0700, one owner) and
+    the sticky bit keeps one uid from deleting another's. Everything below the
+    uid dir -- caches, socket, pid, log -- is that uid's alone."""
+    root = _scratch_root()
+    try:
+        os.mkdir(root, 0o1777)
+    except FileExistsError:
+        pass
+    try:
+        os.chmod(root, 0o1777)          # defeats umask; heals a root this uid made earlier
+    except OSError:
+        pass                            # another uid's root; _mkdir_private explains if it blocks
+    return os.path.join(root, "uid-%d" % os.getuid())
 
 
 def _supervisor_paths() -> dict:
@@ -294,6 +326,9 @@ def _mkdir_private(path: str) -> None:
             os.mkdir(p, 0o700)
         except FileExistsError:
             pass
+        except PermissionError as exc:
+            raise ClangdError("cannot create %s: %s -- a scratch root made by "
+                              "another uid may be blocking it" % (p, exc))
 
 
 def _to_uri(path: str) -> str:
@@ -312,9 +347,6 @@ def _request_timeout() -> float:
     return _env_float("TERMITE_CLANGD_TIMEOUT", DEFAULT_TIMEOUT)
 
 
-_VERSION_CACHE: dict = {}
-
-
 def _parse_clangd_version(text: str) -> "dict[str, object]":
     """Pull (major, minor, patch, raw) out of `clangd --version` output.
 
@@ -331,14 +363,16 @@ def _parse_clangd_version(text: str) -> "dict[str, object]":
             "patch": int(match.group(3)), "binary": None}
 
 
-def _clangd_version(refresh: bool = False) -> "dict[str, object]":
-    """Version of the clangd on PATH (cached).  Never raises: an unreadable or
-    unparseable version comes back with major=None so the caller can carry on."""
+def _clangd_version() -> "dict[str, object]":
+    """Version of the clangd on PATH.  Never raises: an unreadable or
+    unparseable version comes back with major=None so the caller can carry on.
+
+    ponytail: run per call (each _Lsp start and one CLI report) instead of a
+    module cache; memoize in an instance if profiling ever shows clangd
+    --version on a hot path."""
     binary = shutil.which("clangd")
     if binary is None:
         return {"raw": "", "major": None, "minor": None, "patch": None, "binary": None}
-    if not refresh and binary in _VERSION_CACHE:
-        return _VERSION_CACHE[binary]
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True,
                              timeout=10.0)
@@ -347,7 +381,6 @@ def _clangd_version(refresh: bool = False) -> "dict[str, object]":
         info = {"raw": "", "major": None, "minor": None, "patch": None, "binary": None}
     info = dict(info)
     info["binary"] = binary
-    _VERSION_CACHE[binary] = info
     return info
 
 
@@ -482,13 +515,96 @@ def _markup_text(contents) -> str:
     return ""
 
 
-class _Lsp:
+# ---------------------------------------------------------------------------
+#  The command channel: one owner thread per worker, no locks anywhere.
+# ---------------------------------------------------------------------------
+#  Every piece of state belongs to exactly one owner thread; other threads
+#  hand over a callable through a queue and get the result back as a value on
+#  their own one-slot queue (C1, C4).  ponytail: one command runs at a time per
+#  worker; widen to a pipeline if parallelism ever matters.
+def _noop() -> None:
+    """A command that does nothing (used to wake a worker at shutdown)."""
+
+
+def _pop_message(buf: bytes) -> "tuple[dict | None, bytes]":
+    """The first complete LSP frame in buf, or (None, buf) when incomplete."""
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        head, found, rest = buf.partition(sep)
+        if found:
+            break
+    else:
+        return None, buf
+    length = 0
+    for line in head.replace(b"\r\n", b"\n").split(b"\n"):
+        key, _, value = line.decode(errors="replace").partition(":")
+        if key.lower() == "content-length":
+            length = int(value.strip())
+    if len(rest) < length:
+        return None, buf
+    return json.loads(rest[:length]), rest[length:]
+
+
+class _Worker:
+    """Base for single-owner-thread objects; subclasses get _call() and may
+    override _tick() for periodic work while idle."""
+
+    _tick_seconds = 5.0
+
+    def __init__(self) -> None:
+        self._commands: "queue.Queue[tuple]" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve_loop, daemon=True)
+        self._thread.start()
+
+    def _call(self, fn, timeout: float | None = None):
+        """Run fn on the owner thread and return its result; raise what it raised."""
+        reply: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+        self._commands.put((fn, reply))
+        try:
+            kind, value = reply.get(timeout=timeout or (_request_timeout() + 30.0))
+        except queue.Empty:
+            raise ClangdError("%s is not answering" % type(self).__name__)
+        if kind == "err":
+            raise value
+        return value
+
+    def _tick(self) -> None:
+        """Periodic work while idle."""
+
+    def _serve_loop(self) -> None:
+        while True:
+            try:
+                fn, reply = self._commands.get(timeout=self._tick_seconds)
+            except queue.Empty:
+                self._tick()
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                outcome = ("ok", fn())
+            except Exception as exc:                          # noqa: BLE001 - handed to the caller
+                outcome = ("err", exc)
+            if reply is not None:
+                reply.put(outcome)
+            if self._stop.is_set():
+                return
+
+
+class _Lsp(_Worker):
     """One clangd child for one project root.
+
+    Threading: one owner thread runs every protocol exchange and owns all
+    state (`_diags`, `_open`, `_text`, `_id`, `_stderr_tail`); other threads
+    reach it only via _call() -- see _Worker.  ponytail: one request in flight
+    per clangd, executed end to end on the owner; pipeline several if query
+    latency ever matters.
 
     All of clangd's notifications are absorbed here and only ever read back
     through an explicit call, which is what keeps a partially applied edit from
     being pushed at the caller.  A bounded LRU of open files keeps memory in
     check while still avoiding a re-parse on every consecutive query."""
+
+    _tick_seconds = 1.0
 
     def __init__(self, root: str, db_path: str):
         self.root = root
@@ -502,14 +618,12 @@ class _Lsp:
         env["TMPDIR"] = paths["tmp"]           # keeps the ~150 MB of preamble .pch files here
         env["HOME"] = paths["home"]            # 'nobody' has HOME=/nonexistent in the sandbox
         env.pop("CLANGD_FLAGS", None)
-        self._resp: dict = {}
-        self._diags: dict = {}
+        self._diags: dict = {}                 # uri -> (timestamp, diagnostics)
         self._open: "OrderedDict[str, int]" = OrderedDict()
         self._text: dict = {}                  # uri -> text last pushed to clangd
-        self._stderr_tail: "deque[str]" = deque(maxlen=40)
-        self._lock = threading.RLock()
         self._id = 0
-        self.last_used = time.time()
+        self._buf = b""                        # raw bytes read from clangd's stdout
+        self._stderr_tail: "deque[str]" = deque(maxlen=40)
         try:
             self.proc = subprocess.Popen(
                 ["clangd", "--compile-commands-dir=" + paths["compdb"], "--log=error",
@@ -519,36 +633,68 @@ class _Lsp:
         except OSError as exc:
             raise ClangdError("could not start clangd %s: %s"
                               % (self.version.get("binary") or "clangd", exc))
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._fd = self.proc.stdout.fileno()
+        _Worker.__init__(self)
         threading.Thread(target=self._read_stderr, daemon=True).start()
         try:
-            init = self._request("initialize",
-                                 {"processId": os.getpid(), "rootUri": "file://" + root,
-                                  "capabilities": {"textDocument": {"publishDiagnostics": {}}},
-                                  "initializationOptions": {}}, timeout=60.0)
-        except ClangdError as exc:
+            self._call(self._handshake, timeout=60.0)
+        except ClangdError:
             self.close()
-            raise self._error("could not complete the LSP handshake (%s)" % exc)
+            raise
+
+    # -- protocol (owner-thread only below this line) -----------------------
+    def _handshake(self) -> None:
+        init = self._request("initialize",
+                            {"processId": os.getpid(), "rootUri": "file://" + self.root,
+                             "capabilities": {"textDocument": {"publishDiagnostics": {}}},
+                             "initializationOptions": {}}, timeout=60.0)
         result = init.get("result")
         if not isinstance(result, dict) or "capabilities" not in result:
-            self.close()
             raise self._error("returned an initialize response this tool does not understand "
                               "(no 'capabilities'): the clangd on PATH may be a different "
                               "implementation, build or version than expected")
         self._notify("initialized", {})
         _log("clangd %s (pid %d) is serving %s"
-             % (self.version.get("raw") or "version unknown", self.proc.pid, root))
+             % (self.version.get("raw") or "version unknown", self.proc.pid, self.root))
+
+    def _read_message(self, timeout: float) -> "dict | None":
+        """Read one LSP message within timeout seconds (None on timeout)."""
+        deadline = time.time() + timeout
+        while True:
+            msg, self._buf = _pop_message(self._buf)
+            if msg is not None:
+                return msg
+            wait = deadline - time.time()
+            if wait <= 0:
+                return None
+            ready, _, _ = select.select([self._fd], [], [], wait)
+            if not ready:
+                return None
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                raise EOFError("clangd closed its output")
+            self._buf += chunk
+
+    def _absorb(self, msg: dict) -> None:
+        """Fold one notification into owner state; anything else is dropped."""
+        if msg.get("method") == "textDocument/publishDiagnostics":
+            params = msg["params"]
+            self._diags[params["uri"]] = (time.time(), params.get("diagnostics") or [])
 
     def _read_stderr(self) -> None:
-        """Drain clangd's stderr so it can never block, keeping the tail for
-        error messages (bounded: only the last few lines are ever reported)."""
+        """Drain clangd's stderr so it can never block, handing each line to
+        the owner thread, which keeps the tail for error messages (bounded:
+        only the last few lines are ever reported)."""
         try:
             for line in self.proc.stderr:
                 text = line.decode(errors="replace").rstrip()
                 if text:
-                    self._stderr_tail.append(text)
+                    self._commands.put((lambda t=text: self._note_stderr(t), None))
         except Exception:                                     # noqa: BLE001 - pipe closed
             pass
+
+    def _note_stderr(self, text: str) -> None:
+        self._stderr_tail.append(text)
 
     def dead(self) -> bool:
         """True once the clangd process has exited (crash or clean shutdown)."""
@@ -571,38 +717,6 @@ class _Lsp:
         error.retryable = retryable
         return error
 
-    # -- plumbing ----------------------------------------------------------
-    def _reader(self) -> None:
-        stream = self.proc.stdout
-        try:
-            while True:
-                length = 0
-                while True:
-                    line = stream.readline()
-                    if not line:
-                        raise EOFError
-                    line = line.strip()
-                    if not line:
-                        break
-                    key, _, value = line.decode().partition(":")
-                    if key.lower() == "content-length":
-                        length = int(value.strip())
-                msg = json.loads(stream.read(length))
-                with self._lock:
-                    if "id" in msg:
-                        self._resp[msg["id"]] = msg
-                    elif msg.get("method") == "textDocument/publishDiagnostics":
-                        params = msg["params"]
-                        self._diags[params["uri"]] = (time.time(), params.get("diagnostics") or [])
-                    # any other notification is deliberately dropped
-        except Exception:                                     # noqa: BLE001 - clangd went away
-            pass
-        finally:
-            try:
-                self.proc.wait()                              # reap the child, no zombies
-            except Exception:                                 # noqa: BLE001
-                pass
-
     def _send(self, payload: dict) -> None:
         blob = json.dumps(payload).encode()
         try:
@@ -622,33 +736,32 @@ class _Lsp:
         plain ClangdError carrying clangd's own message (a protocol or version
         mismatch shows up here)."""
         timeout = timeout or _request_timeout()
-        with self._lock:
-            self._id += 1
-            rid = self._id
+        self._id += 1
+        rid = self._id
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         deadline = time.time() + timeout
-        msg = None
-        while time.time() < deadline:
-            with self._lock:
-                msg = self._resp.pop(rid, None)
-            if msg is not None:
-                break
-            if self.proc.poll() is not None:
-                with self._lock:
-                    msg = self._resp.pop(rid, None)
-                if msg is None:
-                    raise self._error("exited while answering %s" % method, retryable=True)
-                break
-            time.sleep(0.01)
-        if msg is None:
-            raise self._error("did not answer %s within %.0fs" % (method, timeout),
-                              retryable=True)
-        if "error" in msg:
-            err = msg["error"]
-            detail = err.get("message") if isinstance(err, dict) else err
-            raise ClangdError("%s rejected %s: %s"
-                              % (self.version.get("raw") or "clangd", method, detail))
-        return msg
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise self._error("did not answer %s within %.0fs" % (method, timeout),
+                                  retryable=True)
+            try:
+                msg = self._read_message(remaining)
+            except EOFError:
+                raise self._error("exited while answering %s" % method, retryable=True)
+            if msg is None:
+                raise self._error("did not answer %s within %.0fs" % (method, timeout),
+                                  retryable=True)
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    err = msg["error"]
+                    detail = err.get("message") if isinstance(err, dict) else err
+                    raise ClangdError("%s rejected %s: %s"
+                                      % (self.version.get("raw") or "clangd", method, detail))
+                return msg
+            if "id" in msg:
+                continue                           # stray reply to a timed-out request
+            self._absorb(msg)
 
     # -- files -------------------------------------------------------------
     def _open_path(self, path: str) -> "tuple[str, float]":
@@ -665,13 +778,11 @@ class _Lsp:
             text = open(path, "r", errors="replace").read()
         except OSError as exc:
             raise ClangdError("cannot read %s: %s" % (path, exc))
-        self.last_used = time.time()
         if uri in self._open and self._text.get(uri) == text:
             self._open.move_to_end(uri)
             return uri, 0.0                                   # clangd already holds this text
         pushed = time.time()
-        with self._lock:
-            self._diags.pop(uri, None)                        # drop any pre-change snapshot
+        self._diags.pop(uri, None)                            # drop any pre-change snapshot
         if uri in self._open:
             self._open.move_to_end(uri)
             self._open[uri] += 1
@@ -690,45 +801,59 @@ class _Lsp:
             del self._open[oldest]
             self._text.pop(oldest, None)
             self._notify("textDocument/didClose", {"textDocument": {"uri": oldest}})
-            with self._lock:
-                self._diags.pop(oldest, None)
+            self._diags.pop(oldest, None)
         return uri, pushed
 
-    # -- queries -----------------------------------------------------------
-    def diagnostics(self, path: str, min_severity: str = "hint") -> list:
+    # -- queries (public: any thread; each runs on the owner) --------------
+    def diagnostics(self, path: str, min_severity: Severity | str = Severity.HINT) -> list:
+        return self._call(lambda: self._diagnostics_impl(path, Severity(min_severity)))
+
+    def hover(self, path: str, line: int, col: int):
+        return self._call(lambda: self._hover_impl(path, line, col))
+
+    def locations(self, method: str, path: str, line: int, col: int, extra: dict | None = None) -> list:
+        return self._call(lambda: self._locations_impl(method, path, line, col, extra))
+
+    def status(self) -> dict:
+        """Live facts about this clangd; answers within seconds even when busy."""
+        return self._call(self._status_impl, timeout=5.0)
+
+    def _diagnostics_impl(self, path: str, min_severity: Severity) -> list:
         settle = _env_float("TERMITE_CLANGD_SETTLE", DEFAULT_SETTLE)
         uri, pushed = self._open_path(path)
         deadline = time.time() + _request_timeout()
         seen_ts = None          # timestamp of the newest snapshot clangd published
         quiet_since = None      # when that snapshot last changed
-        settled = False
-        while time.time() < deadline:
-            with self._lock:
-                hit = self._diags.get(uri)
+        while True:
+            hit = self._diags.get(uri)
             current = hit is not None and (pushed == 0.0 or hit[0] >= pushed)
             if current and pushed == 0.0:
-                settled = True
                 break                                          # unchanged text: snapshot is current
             if current:
                 if hit[0] != seen_ts:                          # a fresh snapshot arrived
                     seen_ts = hit[0]
                     quiet_since = time.time()
                 elif time.time() - quiet_since >= settle:      # nothing new for `settle`
-                    settled = True
                     break
-            elif self.proc.poll() is not None:
+            now = time.time()
+            if now >= deadline:
+                raise self._error("did not report diagnostics for %s within %.0fs"
+                                  % (path, _request_timeout()), retryable=True)
+            if self.proc.poll() is not None:
                 raise self._error("exited before reporting diagnostics for %s" % path,
                                   retryable=True)
-            time.sleep(0.05)
-        if not settled:
-            raise self._error("did not report diagnostics for %s within %.0fs"
-                              % (path, _request_timeout()), retryable=True)
-        with self._lock:
-            raw = (self._diags.get(uri) or (0, []))[1]
-        allowed = _SEVERITY_RANK.get(min_severity, 4)
+            try:
+                msg = self._read_message(min(0.05, deadline - now))
+            except EOFError:
+                raise self._error("exited before reporting diagnostics for %s" % path,
+                                  retryable=True)
+            if msg is not None and "id" not in msg:
+                self._absorb(msg)                              # notifications -> _diags
+        raw = (self._diags.get(uri) or (0, []))[1]
+        allowed = _SEVERITY_RANK[min_severity]
         out = []
         for item in raw:
-            severity = _SEVERITY_NAME.get(item.get("severity"), "hint")
+            severity = _SEVERITY_NAME.get(item.get("severity"), Severity.HINT)
             if _SEVERITY_RANK[severity] > allowed:
                 continue
             where = _rng(item.get("range") or {})
@@ -739,7 +864,7 @@ class _Lsp:
                                   message=(item.get("message") or "").splitlines()[0] if item.get("message") else ""))
         return out
 
-    def hover(self, path: str, line: int, col: int):
+    def _hover_impl(self, path: str, line: int, col: int):
         uri, _ = self._open_path(path)
         result = self._request("textDocument/hover",
                                {"textDocument": {"uri": uri}, "position": _pos(line, col)}).get("result")
@@ -751,7 +876,7 @@ class _Lsp:
         signature, _, rest = text.partition("\n")
         return Hover(signature=signature.strip(), doc=rest.strip().strip("`").strip())
 
-    def locations(self, method: str, path: str, line: int, col: int, extra: dict | None = None) -> list:
+    def _locations_impl(self, method: str, path: str, line: int, col: int, extra: dict | None = None) -> list:
         uri, _ = self._open_path(path)
         params = {"textDocument": {"uri": uri}, "position": _pos(line, col)}
         if extra:
@@ -766,18 +891,21 @@ class _Lsp:
             found.append(Location(file=_from_uri(target), **where))
         return found
 
-    def status(self) -> dict:
-        return {"root": self.root, "clangd_pid": self.proc.pid,
+    def _status_impl(self) -> dict:
+        return {"clangd_pid": self.proc.pid,
                 "clangd_version": self.version.get("raw") or "",
-                "idle_seconds": round(time.time() - self.last_used, 1),
                 "open_files": len(self._open),
                 "rss_mib": round(_rss_mib(self.proc.pid), 1)}
 
     def close(self) -> None:
+        """Kill this clangd and stop its owner thread within a bound."""
+        self._stop.set()
         try:
             self.proc.kill()
         except Exception:                                     # noqa: BLE001
             pass
+        self._commands.put((_noop, None))            # wake the owner if it is idle
+        self._thread.join(timeout=5.0)
 
 
 def _rss_mib(pid: int) -> float:
@@ -794,51 +922,79 @@ def _rss_mib(pid: int) -> float:
 # ---------------------------------------------------------------------------
 #  The supervisor: owns every clangd child, enforces idle timeout + LRU cap
 # ---------------------------------------------------------------------------
-class _Supervisor:
+class _Supervisor(_Worker):
     """Registry of root -> _Lsp, with an idle timeout and an LRU cap on how many
-    clangd instances may be warm at once (each one costs hundreds of MiB)."""
+    clangd instances may be warm at once (each one costs hundreds of MiB).
+
+    Threading: one owner thread owns the registry and runs every request;
+    serve_conn threads only do socket I/O and hand commands over (see
+    _Worker).  The monitor reaper is this worker's idle _tick.
+    ponytail: one worker serializes requests across roots; per-root workers
+    if parallel roots ever matter."""
+
+    _tick_seconds = 15.0
 
     def __init__(self) -> None:
         self.instances: dict = {}
         self.last_used: dict = {}
-        self.lock = threading.RLock()
         self.started = time.time()
         self.last_request = time.time()
         self.idle_timeout = _env_float("TERMITE_CLANGD_IDLE", DEFAULT_IDLE)
         self.max_instances = max(1, _env_int("TERMITE_CLANGD_MAX", DEFAULT_MAX))
+        _Worker.__init__(self)
+
+    def _tick(self) -> None:
+        """Reclaim memory: drop clangd instances that have gone idle, and exit
+        once nothing is warm and no one has asked for anything for a while."""
+        now = time.time()
+        for root in list(self.instances):
+            instance = self.instances[root]
+            if instance.dead():
+                self.instances.pop(root, None)
+                self.last_used.pop(root, None)
+                _log("clangd pid=%d for %s exited; dropped" % (instance.proc.pid, root))
+                continue
+            if now - self.last_used.get(root, now) > self.idle_timeout:
+                self.instances.pop(root)
+                self.last_used.pop(root, None)
+                instance.close()
+                _log("idle timeout: closed clangd pid=%d for %s" % (instance.proc.pid, root))
+        if not self.instances and now - max(self.last_request, self.started) > 120:
+            _log("supervisor idle with nothing warm; exiting")
+            # ponytail: hard exit is the daemon's defined end (C2); drain
+            # in-flight connections gracefully if that ever stops being enough
+            os._exit(0)
 
     def _instance(self, root: str) -> _Lsp:
         """The warm clangd for `root`, starting one on first use and silently
         replacing one that has crashed.  Raises ClangdError (no usable database,
         unsupported clangd, failed handshake) rather than returning a bad one."""
         root = os.path.realpath(root)
-        with self.lock:
-            self.last_used[root] = time.time()
-            existing = self.instances.get(root)
-            if existing is not None and not existing.dead():
-                return existing
-            if existing is not None:                          # it crashed: replace it
-                self.instances.pop(root, None)
-                _log("clangd pid=%d for %s had already exited; replacing it"
-                     % (existing.proc.pid, root))
-                existing.close()
-            db_path = _require_db(root)
-            while len(self.instances) >= self.max_instances:
-                self._evict_lru(keep=root)
-            started = time.time()
-            instance = _Lsp(root, db_path)                    # may raise ClangdError
-            self.instances[root] = instance
-            self.last_used[root] = time.time()
-            _log("started clangd pid=%d for %s in %.1fs" % (instance.proc.pid, root, time.time() - started))
-            return instance
+        self.last_used[root] = time.time()
+        existing = self.instances.get(root)
+        if existing is not None and not existing.dead():
+            return existing
+        if existing is not None:                          # it crashed: replace it
+            self.instances.pop(root, None)
+            _log("clangd pid=%d for %s had already exited; replacing it"
+                 % (existing.proc.pid, root))
+            existing.close()
+        db_path = _require_db(root)
+        while len(self.instances) >= self.max_instances:
+            self._evict_lru(keep=root)
+        started = time.time()
+        instance = _Lsp(root, db_path)                    # may raise ClangdError
+        self.instances[root] = instance
+        self.last_used[root] = time.time()
+        _log("started clangd pid=%d for %s in %.1fs" % (instance.proc.pid, root, time.time() - started))
+        return instance
 
     def _forget(self, root: str, instance: _Lsp) -> None:
         """Drop `instance` from the registry (only if it is still the current
         one) and kill it, so the next request starts a fresh clangd."""
-        with self.lock:
-            if self.instances.get(root) is instance:
-                self.instances.pop(root, None)
-                self.last_used.pop(root, None)
+        if self.instances.get(root) is instance:
+            self.instances.pop(root, None)
+            self.last_used.pop(root, None)
         instance.close()
 
     def _serve(self, root: str, action) -> dict:
@@ -882,16 +1038,15 @@ class _Supervisor:
         return victim
 
     def _close(self, root: str | None) -> int:
-        with self.lock:
-            targets = [os.path.realpath(root)] if root else list(self.instances)
-            closed = 0
-            for target in targets:
-                instance = self.instances.pop(target, None)
-                self.last_used.pop(target, None)
-                if instance is not None:
-                    instance.close()
-                    closed += 1
-            return closed
+        targets = [os.path.realpath(root)] if root else list(self.instances)
+        closed = 0
+        for target in targets:
+            instance = self.instances.pop(target, None)
+            self.last_used.pop(target, None)
+            if instance is not None:
+                instance.close()
+                closed += 1
+        return closed
 
     def handle(self, request: dict) -> dict:
         method = request.get("method")
@@ -900,10 +1055,19 @@ class _Supervisor:
         if method == "ping":
             return {"ok": True, "supervisor_pid": os.getpid(), "started": self.started}
         if method == "status":
-            with self.lock:
-                return {"ok": True, "supervisor_pid": os.getpid(),
-                        "clangd_version": _clangd_version().get("raw", ""),
-                        "instances": [self.instances[r].status() for r in list(self.instances)]}
+            instances: list[InstanceInfo] = []
+            for r in list(self.instances):
+                try:
+                    info = self.instances[r].status()
+                except ClangdError:                           # busy: report what we know
+                    info = {"clangd_pid": 0, "clangd_version": "",
+                            "open_files": 0, "rss_mib": 0.0}
+                instances.append(InstanceInfo(
+                    root=r, idle_seconds=round(time.time() - self.last_used.get(r, time.time()), 1),
+                    **info))
+            return {"ok": True, "supervisor_pid": os.getpid(),
+                    "clangd_version": _clangd_version().get("raw", ""),
+                    "instances": instances}
         if method == "close":
             return {"ok": True, "closed": self._close(root)}
         if method == "shutdown":
@@ -918,7 +1082,7 @@ class _Supervisor:
         try:
             if method == "diagnostics":
                 return self._serve(root, lambda i: {
-                    "diagnostics": i.diagnostics(path, request.get("min_severity", "hint"))})
+                    "diagnostics": i.diagnostics(path, Severity(request.get("min_severity", "hint")))})
             if method == "hover":
                 line, col = int(request["line"]), int(request["col"])
                 return self._serve(root, lambda i: {"hover": i.hover(path, line, col)})
@@ -936,11 +1100,14 @@ class _Supervisor:
         return {"ok": False, "error": "unknown method %r" % (method,)}
 
     def serve_conn(self, conn: socket.socket) -> None:
+        """One client connection: read JSON request lines, answer each with the
+        supervisor owner thread's response (socket I/O stays on this thread)."""
         try:
             stream = conn.makefile("rwb")
             for line in stream:
                 try:
-                    response = self.handle(json.loads(line))
+                    response = self._call(lambda: self.handle(json.loads(line)),
+                                          timeout=_request_timeout() + 120.0)
                 except Exception as exc:                      # noqa: BLE001 - never kill the daemon
                     response = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
                 stream.write((json.dumps(response) + "\n").encode())
@@ -952,29 +1119,6 @@ class _Supervisor:
                 conn.close()
             except OSError:
                 pass
-
-    def monitor(self) -> None:
-        """Reclaim memory: drop clangd instances that have gone idle, and exit
-        once nothing is warm and no one has asked for anything for a while."""
-        while True:
-            time.sleep(15)
-            with self.lock:
-                now = time.time()
-                for root in list(self.instances):
-                    instance = self.instances[root]
-                    if instance.dead():
-                        self.instances.pop(root, None)
-                        self.last_used.pop(root, None)
-                        _log("clangd pid=%d for %s exited; dropped" % (instance.proc.pid, root))
-                        continue
-                    if now - self.last_used.get(root, now) > self.idle_timeout:
-                        self.instances.pop(root)
-                        self.last_used.pop(root, None)
-                        instance.close()
-                        _log("idle timeout: closed clangd pid=%d for %s" % (instance.proc.pid, root))
-                if not self.instances and now - max(self.last_request, self.started) > 120:
-                    _log("supervisor idle with nothing warm; exiting")
-                    os._exit(0)
 
 
 def _log(message: str) -> None:
@@ -1022,7 +1166,6 @@ def _daemon_main() -> int:
     with open(paths["pid"], "w") as handle:
         handle.write("%d\n" % os.getpid())
     _log("supervisor up, idle_timeout=%.0fs max=%d" % (supervisor.idle_timeout, supervisor.max_instances))
-    threading.Thread(target=supervisor.monitor, daemon=True).start()
     while True:
         try:
             conn, _ = server.accept()
@@ -1107,14 +1250,14 @@ def _restart_supervisor(timeout: float = 60.0) -> None:
 
 
 def _rpc_once(request: dict, timeout: float) -> dict:
-    """One round trip to the supervisor.  Raises _SupervisorGone when the
+    """One round trip to the supervisor.  Raises _SupervisorGoneError when the
     connection died (so _rpc can restart it), or ClangdError for a real error."""
     try:
         sock = _connect(timeout)
     except PermissionError:
         raise ClangdError(_permission_help())
     except OSError as exc:
-        raise _SupervisorGone("could not reach the clangd supervisor: %s" % exc)
+        raise _SupervisorGoneError("could not reach the clangd supervisor: %s" % exc)
     try:
         sock.sendall((json.dumps(request) + "\n").encode())
         buf = b""
@@ -1124,17 +1267,17 @@ def _rpc_once(request: dict, timeout: float) -> dict:
                 break
             buf += chunk
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
-        raise _SupervisorGone("the clangd supervisor connection broke: %s" % exc)
+        raise _SupervisorGoneError("the clangd supervisor connection broke: %s" % exc)
     except socket.timeout:
         raise ClangdError("timed out after %.0fs waiting for clangd" % timeout)
     finally:
         sock.close()
     if not buf.strip():
-        raise _SupervisorGone("the clangd supervisor closed the connection without answering")
+        raise _SupervisorGoneError("the clangd supervisor closed the connection without answering")
     try:
         response = json.loads(buf)
     except ValueError as exc:
-        raise _SupervisorGone("the clangd supervisor sent an unreadable reply: %s" % exc)
+        raise _SupervisorGoneError("the clangd supervisor sent an unreadable reply: %s" % exc)
     if not response.get("ok"):
         raise ClangdError(response.get("error") or "the clangd supervisor reported an error")
     return response
@@ -1147,7 +1290,7 @@ def _rpc(request: dict, timeout: float | None = None) -> dict:
     _ensure_supervisor()
     try:
         return _rpc_once(request, timeout)
-    except _SupervisorGone:
+    except _SupervisorGoneError:
         _restart_supervisor()
         return _rpc_once(request, timeout)
 
@@ -1173,15 +1316,19 @@ def available() -> bool:
     return shutil.which("clangd") is not None
 
 
-def diagnostics(root: str, path: str, min_severity: str = "hint",
+def diagnostics(root: str, path: str, min_severity: Severity | str = Severity.HINT,
                 timeout: float | None = None) -> list[Diagnostic]:
     """Ask clangd for the compiler errors and warnings in `path`, reflecting the file's text on disk right now.
 
     `root` is the project directory (the one holding the compile database); `path` is the source file to check. clangd re-parses the file and the answer is awaited until the stream goes quiet (TERMITE_CLANGD_SETTLE seconds), so the result is a settled parse, not a half-finished one. Only severities at or above `min_severity` ('hint' < 'info' < 'warning' < 'error') are returned, each as a Diagnostic with 1-based line/col. A clean file returns an empty list; raises ClangdError when the project has no usable compile database.
     """
     response = _rpc({"method": "diagnostics", "root": os.path.realpath(root),
-                     "path": os.path.realpath(path), "min_severity": min_severity}, timeout)
-    return response["diagnostics"]
+                     "path": os.path.realpath(path),
+                     "min_severity": Severity(min_severity)}, timeout)
+    items = response["diagnostics"]
+    for item in items:
+        item["severity"] = Severity(item["severity"])
+    return items
 
 
 def check(root: str, path: str, timeout: float | None = None) -> CheckSummary:
@@ -1190,13 +1337,13 @@ def check(root: str, path: str, timeout: float | None = None) -> CheckSummary:
     Warnings, infos and hints are counted but do not make a file unclean, which is exactly what makes this the one-call verb for a build-test-fix loop: edit until `clean` is True. It is a thin wrapper over `diagnostics`, so the same rules about the project and the settle window apply.
     """
     items = diagnostics(root, path, timeout=timeout)
-    counts = {"error": 0, "warning": 0, "info": 0, "hint": 0}
+    counts: dict[Severity, int] = {s: 0 for s in Severity}
     for item in items:
         counts[item["severity"]] = counts.get(item["severity"], 0) + 1
     return CheckSummary(file=os.path.realpath(path),
-                        errors=counts["error"], warnings=counts["warning"],
-                        infos=counts["info"], hints=counts["hint"],
-                        total=len(items), clean=counts["error"] == 0)
+                        errors=counts[Severity.ERROR], warnings=counts[Severity.WARNING],
+                        infos=counts[Severity.INFO], hints=counts[Severity.HINT],
+                        total=len(items), clean=counts[Severity.ERROR] == 0)
 
 
 def hover(root: str, path: str, line: int, col: int,
@@ -1320,7 +1467,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("db-health", help="report on the project's compile_commands.json")
     diag = sub.add_parser("diagnostics", help="print compiler diagnostics for FILE...")
     diag.add_argument("files", nargs="*")
-    diag.add_argument("--min-severity", default="hint", choices=["hint", "info", "warning", "error"])
+    diag.add_argument("--min-severity", default="hint", choices=[s.value for s in Severity])
     chk = sub.add_parser("check", help="count diagnostics per file; exit 1 if any file has errors")
     chk.add_argument("files", nargs="*")
     for name in ("hover", "definition", "references"):
@@ -1444,7 +1591,7 @@ def _selftest_live(directory: str) -> list[str]:
         if not (health["present"] and health["fresh"]):
             failures.append("live: compile_db_health should be present+fresh, got %s" % health["hint"])
         found = diagnostics(directory, bad)
-        if len(found) != 1 or found[0]["severity"] != "error":
+        if len(found) != 1 or found[0]["severity"] != Severity.ERROR:
             failures.append("live: expected exactly 1 error in bad.cpp, got %r" % (found,))
         elif found[0]["line"] != 1:
             failures.append("live: error should be on line 1, got %d" % found[0]["line"])
@@ -1468,7 +1615,7 @@ def _selftest_live(directory: str) -> list[str]:
             except OSError:
                 pass
             again = diagnostics(directory, bad)
-            if len(again) != 1 or again[0]["severity"] != "error":
+            if len(again) != 1 or again[0]["severity"] != Severity.ERROR:
                 failures.append("live: did not recover from a clangd crash, got %r" % (again,))
     finally:
         close(directory)
@@ -1499,8 +1646,10 @@ def _selftest() -> int:
         check("reject FILE without LINE:COL", True)
     check("1-based line/col -> LSP 0-based", _pos(1, 1) == {"line": 0, "character": 0})
     check("uri round trip", _from_uri(_to_uri("/tmp/icf")) == "/tmp/icf")
-    check("severity names", _SEVERITY_NAME[1] == "error" and _SEVERITY_RANK["hint"] == 4)
+    check("severity names", _SEVERITY_NAME[1] is Severity.ERROR and _SEVERITY_RANK[Severity.HINT] == 4)
     check("scratch is keyed by uid", ("uid-%d" % os.getuid()) in _uid_dir())
+    check("scratch root shared across uids (01777)",
+          os.stat(_scratch_root()).st_mode & 0o7777 == 0o1777)
     check("per-root cache is distinct", _project_paths("/a/b")["dir"] != _project_paths("/a/c")["dir"])
     check("parse clangd version", _parse_clangd_version("clangd version 18.1.3")["major"] == 18)
     check("parse distro clangd version",

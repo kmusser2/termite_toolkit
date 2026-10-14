@@ -15,10 +15,29 @@ import os
 import re
 import sys
 
-CSI = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
+# The escape-sequence patterns -- one owner for "what an ANSI escape looks
+# like". The str variants are derived from the bytes patterns, never copied.
+CSI = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]')  # full CSI grammar (ECMA-48)
 BG = re.compile(rb'\x1b\[48;5;(\d+)m')
 FG = re.compile(rb'\x1b\[38;5;(\d+)m')
 OSC = re.compile(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')  # OSC title/hyperlink sequences
+CSI_TEXT = re.compile(CSI.pattern.decode())
+OSC_TEXT = re.compile(OSC.pattern.decode())
+
+
+def strip(data: bytes) -> bytes:
+    """Remove every ANSI escape sequence (CSI and OSC) from bytes."""
+    return OSC.sub(b'', CSI.sub(b'', data))
+
+
+def strip_str(text: str) -> str:
+    """Remove every ANSI escape sequence (CSI and OSC) from a str."""
+    return OSC_TEXT.sub('', CSI_TEXT.sub('', text))
+
+
+__all__ = ["load", "strip", "strip_str",
+           "cmd_strip", "cmd_colors", "cmd_count", "cmd_frames",
+           "selftest", "main"]
 
 
 def load(args: list[str]) -> bytes:
@@ -29,14 +48,14 @@ def load(args: list[str]) -> bytes:
     return sys.stdin.buffer.read()
 
 
-def cmd_strip(data: bytes) -> str:
+def cmd_strip(data: bytes) -> None:
     """Strip ANSI CSI/OSC sequences from data, write to stdout, ensuring a trailing newline."""
-    sys.stdout.buffer.write(OSC.sub(b'', CSI.sub(b'', data)))
+    sys.stdout.buffer.write(strip(data))
     if not data.endswith(b'\n'):
         sys.stdout.buffer.write(b'\n')
 
 
-def cmd_colors(data: bytes) -> str:
+def cmd_colors(data: bytes) -> None:
     """Print per-line 256-color bg/fg codes plus counts of ghost (\u2592) and \u2550 glyphs."""
     for i, line in enumerate(data.split(b'\n')):
         bg = [int(x) for x in BG.findall(line)]
@@ -47,13 +66,13 @@ def cmd_colors(data: bytes) -> str:
             print(f'line {i:3d}: bg={bg} fg={fg} ghost_chars={ghost} ═={eq}')
 
 
-def cmd_count(data: bytes, glyph: str) -> str:
+def cmd_count(data: bytes, glyph: str) -> None:
     """Print how many times glyph appears in data."""
     gb = glyph.encode('utf-8')
     print(data.count(gb))
 
 
-def cmd_frames(data: bytes) -> str:  # frames are separated by the "home cursor" escape \x1b[H
+def cmd_frames(data: bytes) -> None:  # frames are separated by the "home cursor" escape \x1b[H
     """Print the number of frames in data (separated by the \x1b[H home-cursor escape)."""
     # frames are separated by the "home cursor" escape \x1b[H
     print(len(data.split(b'\x1b[H')) - 1)
@@ -118,6 +137,11 @@ def selftest() -> int:
         check('strip OSC title+link', sys.stdout.buffer.getvalue() == b'hi link\n')
     finally:
         sys.stdout = old
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        argv_ok = main(['-h']) == 0 and main([]) == 1
+    check('main(argv) honors argv', argv_ok)
     import subprocess
     tool = os.path.abspath(__file__)
     rr = subprocess.run([sys.executable, tool, '-h'], capture_output=True, timeout=15)
@@ -131,7 +155,6 @@ def selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point (see the module docstring for usage)."""
     args = sys.argv[1:] if argv is None else list(argv)
-    args = sys.argv[1:]
     if not args or args[0] in ('-h', '--help'):
         print(__doc__)
         return 0 if args else 1

@@ -22,14 +22,36 @@ Relative paths resolve to the workspace root (the directory containing src/ and 
   fio.py --selftest               run self tests
 """
 import os
-import re
 import shutil
 import sys
 import time
 import stat
 
+import ansi
+
 # Workspace root (contains src/ and tmp/); relative paths resolve here.
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+__all__ = ["resolve", "atomic_write", "selftest", "main"]
+
+
+def atomic_write(path: str, text: str) -> None:
+    """Replace path with text atomically (temp file + os.replace), preserving
+    the replaced file's mode; raises OSError on failure.
+
+    The one home of the sandbox's atomic-replace dance: plain 'w' overwrites of
+    existing files are denied (Errno 13), so every in-place rewrite goes
+    through a fresh temp file swapped in with os.replace.
+    """
+    tmp = path + '.new'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    # Preserve the original file's mode (e.g. executable bit on scripts).
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    except OSError:
+        pass
+    os.replace(tmp, path)
 
 
 def resolve(path: str) -> str:
@@ -104,15 +126,8 @@ def cmd_write(args: list[str]) -> None:
     need_args(args, 2)
     p = resolve(args[0])
     text = ' '.join(args[1:])
-    # Atomic write (.new + os.replace): the sandbox denies plain 'w' on an
-    # existing file, so a direct overwrite would fail with Errno 13.
     body = text + ('\n' if text and not text.endswith('\n') else '')
-    tmp = p + '.new'
-    with open(tmp, 'w') as f:
-        f.write(body)
-    if os.path.exists(p):
-        os.chmod(tmp, stat.S_IMODE(os.stat(p).st_mode))
-    os.replace(tmp, p)
+    atomic_write(p, body)
     print(f"wrote {len(text)} chars to {args[0]}")
 
 
@@ -203,10 +218,9 @@ def cmd_strip_ansi(args: list[str]) -> None:
     """Print a file with ANSI escape sequences removed."""
     need_args(args, 1)
     p = resolve(args[0])
-    ansi = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
     with open(p, 'r', errors='replace') as f:
         for line in f:
-            print(ansi.sub('', line), end='')
+            print(ansi.strip_str(line), end='')
 
 
 CMDS = {
@@ -237,6 +251,10 @@ def selftest() -> int:
     check('no .new left behind', not os.path.exists(p + '.new'))
     cmd_append([p, 'again'])
     check('append', open(p).read() == 'world\nagain\n')
+    os.chmod(p, 0o755)
+    atomic_write(p, 'mode')
+    import stat as _stat
+    check('atomic_write preserves mode', _stat.S_IMODE(os.stat(p).st_mode) == 0o755)
     cmd_backup([p])
     baks = [f for f in os.listdir(d) if f.endswith('.bak')]
     check('backup created', len(baks) == 1)

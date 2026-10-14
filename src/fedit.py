@@ -30,6 +30,9 @@ from typing import Sequence
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 
+__all__ = ["resolve", "run_fedit", "selftest", "main"]
+
+
 def resolve(path: str) -> str:
     """Resolve a path relative to this module's directory to an absolute path."""
     p = path if os.path.isabs(path) else os.path.join(BASE, path)

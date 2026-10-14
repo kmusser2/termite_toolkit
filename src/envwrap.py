@@ -38,6 +38,9 @@ from collections.abc import Sequence
 _HELPERS: tuple[str, ...] = ("envrun", "pip", "permissions-check.sh")
 
 
+__all__ = ["envrun", "helper_dir", "permissions_check", "pip", "selftest", "main"]
+
+
 def helper_dir() -> str:
     """Absolute path of the directory holding the shell helper payload."""
     return os.path.dirname(os.path.abspath(__file__))

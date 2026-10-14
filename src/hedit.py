@@ -32,12 +32,12 @@ anchored lines*, so you can emit it directly; no formatting needed:
   one, not both. context= keeps N lines around each match (spans merged).
   offset/limit (a page) cannot be combined with a filter. A filtered read that
   matched nothing prints  "# no matches for pattern='...'".
-  ReadResult is a dict: res["lines"] (list of Line), res["hits"] (matched
-  line numbers; [] means none), res["windows"] (returned [start,end] ranges),
-  res["payload"] (the printable lines), res["query"] (the filter that ran, or
-  None for a whole-file/page read), res["truncated"], res["next_offset"],
-  res["total_lines"]. Read res["query"] to tell a filter that matched nothing
-  (query set, hits == []) from a page (query None).
+  ReadResult is a frozen dataclass: .lines (tuple of Line), .hits (matched
+  line numbers; () means none), .windows ((start,end) ranges),
+  .payload (the printable lines), .query (the filter that ran, or
+  None for a whole-file/page read), .truncated, .next_offset,
+  .total_lines. Read .query to tell a filter that matched nothing
+  (query set, hits == ()) from a page (query None).
 
 DISCOVER, THEN EXPAND (one expression, no second round-trip):
     m   = hedit.match("foo.py", pattern="^def ")   # -> Match(path, hits, query)
@@ -49,18 +49,19 @@ ANCHORS -- an anchor is "LN#HASH" (e.g. 12#NKA). Each Line prints as
 (the hash) alone is NOT an anchor and will be rejected.
 
 EDITING (stale-safe; nothing is written when an anchor is bad or stale):
-    hedit.replace("foo.py", "12#NKA", ["new line"])           -> {"ok": True, ...}
-    hedit.replace("foo.py", "12#NKA", ["new"], preview=True)  -> {"ok": True, "preview": True, "diff": "...", ...} (no write)
+    hedit.replace("foo.py", "12#NKA", ["new line"])           -> EditResult(ok=True, ...)
+    hedit.replace("foo.py", "12#NKA", ["new"], preview=True)  -> EditResult(ok=True, preview=True, diff="...") (no write)
     hedit.insert("foo.py", "12#NKA", ["x"], before=True)      # default inserts after
     hedit.delete("foo.py", "12#NKA")                          # or an [anchor, end_anchor] range
     hedit.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
     hedit.hash_line("def f():", 12)                           -> "NKA"
 
-ERRORS -- an edit returns {"ok": false, "error": TAG, "message": ...} and writes
-nothing. TAG is "stale" (anchor well-formed but the line changed), "validation"
-(bad batch edit shape), or "usage" (malformed args: bad regex, bad anchor,
-incompatible options). "io" is filesystem/size/encoding. The CLI prints the same
-JSON on stdout and exits 2 for "usage", 1 otherwise.
+ERRORS -- an edit returns EditResult(ok=False, error=TAG, message=...) and
+writes nothing. TAG is "stale" (anchor well-formed but the line changed) or
+"validation" (bad batch edit shape); malformed args raise UsageError and
+filesystem problems raise OSError. EditResult.to_json() is the wire shape: the
+CLI prints that JSON on stdout ("usage"/"io" for its own boundary errors) and
+exits 2 for "usage", 1 otherwise.
 
 CLI:
   ./hedit.py read <file> [--offset N] [--limit M] [--pattern RE | --grep PAT]
@@ -78,9 +79,16 @@ import difflib
 import json
 import os
 import re
-import stat
 import sys
-from typing import Any, Iterable, NamedTuple, Sequence, TypedDict
+from dataclasses import asdict, dataclass
+from typing import Iterable, NamedTuple, Sequence, TypedDict
+
+import fio
+
+__all__ = ["Edit", "EditResult", "Line", "Match", "ReadResult",
+           "fnv1a_32", "hash_line", "parse_anchor", "read_lines", "read_file",
+           "match", "window", "replace", "insert", "delete", "batch",
+           "write_lines_atomic", "main"]
 
 HASH_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 chars, drops 0/O/1/I
 HASH_LEN = 3
@@ -149,30 +157,69 @@ class Match(NamedTuple):
     query: str
 
 
-class ReadResult(dict):
-    """read_file()/window() result: the documented dict that ALSO renders as the
-    anchored lines, so it can be handed back directly with no formatting.
+@dataclass(frozen=True, repr=False)
+class ReadResult:
+    """read_file()/window() result: the anchored lines plus their metadata.
 
-    str(res)/repr(res) return the payload block -- one "LN#HASH|text" per line
-    (bare text when plain=True) -- or "# no matches for <query>" when a
-    pattern/grep filter matched nothing. It is a real dict; keys are "ok",
-    "lines", "hits", "windows", "payload", "truncated", "next_offset",
-    "total_lines", "query". "query" is the filter that ran (e.g.
-    "pattern='^def '"), or None for a whole-file/page read -- so read it to tell
-    "a filter matched nothing" (query set, hits == []) apart from "this was a
-    page" (query None). Use dict(res) to see the raw mapping.
+    Renders as the payload block -- one "LN#HASH|text" per line (bare text when
+    plain=True) -- or "# no matches for <query>" when a pattern/grep filter
+    matched nothing, so it can be handed back directly with no formatting.
+    Fields: lines (tuple of Line), hits (matched 1-based line numbers; ()
+    means none), windows ((start, end) ranges), payload (the printable lines),
+    query (the filter that ran, e.g. "pattern='^def '", or None for a
+    whole-file/page read), truncated, next_offset, total_lines. Read .query to
+    tell "a filter matched nothing" (query set, hits == ()) apart from "this
+    was a page" (query None).
     """
+    ok: bool
+    lines: tuple[Line, ...]
+    hits: tuple[int, ...]
+    windows: tuple[tuple[int, int], ...]
+    payload: tuple[str, ...]
+    truncated: bool
+    next_offset: int | None
+    total_lines: int
+    query: str | None
 
     def __str__(self) -> str:
-        payload = self.get("payload") or []
-        if payload:
-            return "\n".join(payload)
-        query = self.get("query")
-        if query is not None:
-            return "# no matches for %s" % query
+        if self.payload:
+            return "\n".join(self.payload)
+        if self.query is not None:
+            return "# no matches for %s" % self.query
         return ""
 
     __repr__ = __str__
+
+
+@dataclass(frozen=True)
+class EditResult:
+    """One edit's outcome (replace/insert/delete/batch).
+
+    On success: first_changed_line/last_changed_line (1-based; batch also sets
+    edits_applied), and -- when preview=True -- diff, with nothing written. On
+    failure: error ("stale" | "validation") and message, with nothing written.
+    to_json() gives the CLI's documented JSON shape.
+    """
+    ok: bool
+    error: str | None = None
+    message: str | None = None
+    preview: bool = False
+    diff: str | None = None
+    first_changed_line: int | None = None
+    last_changed_line: int | None = None
+    edits_applied: int | None = None
+
+    def to_json(self) -> dict[str, object]:
+        """The wire shape (JSON boundary conversion): only the keys carried."""
+        out: dict[str, object] = {"ok": self.ok}
+        for key in ("error", "message", "diff",
+                    "first_changed_line", "last_changed_line", "edits_applied"):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        if self.preview:
+            out["preview"] = True
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -245,25 +292,21 @@ def _detect_ending(content):
 
 def _unified_diff(path, old_lines, new_lines):
     """Human-visible unified diff between two line lists (stdlib difflib)."""
-    a = [l + "\n" for l in old_lines]
-    b = [l + "\n" for l in new_lines]
+    a = [text + "\n" for text in old_lines]
+    b = [text + "\n" for text in new_lines]
     return "".join(difflib.unified_diff(a, b, fromfile=path, tofile=path))
 
 
 def write_lines_atomic(path: str, lines: Sequence[str], ending: str = "\n") -> None:
-    """Write lines to path atomically (.hedit-new + os.replace), preserving the file mode."""
+    """Write lines to path atomically, preserving the file mode.
+
+    The replace mechanism is fio.atomic_write's (its contract); this adds the
+    line-joining convention (trailing `ending` after a non-empty line list).
+    """
     text = ending.join(lines)
     if lines:
         text += ending
-    tmp = path + ".hedit-new"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    # Preserve the original file's mode (e.g. executable bit on scripts).
-    try:
-        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    fio.atomic_write(path, text)
 
 
 # --------------------------------------------------------------------------
@@ -286,12 +329,12 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None,
     Give pattern or grep, never both. offset/limit cannot be combined with a
     filter, and context= is only meaningful together with one.
 
-    Returns a ReadResult (a dict that str()s as the payload): res["lines"]
-    (list of Line), res["hits"] (matched 1-based line numbers), res["windows"]
-    (returned [start, end] ranges), res["payload"] (the printable lines),
-    res["query"] (the filter that ran, or None for a page), res["truncated"],
-    res["next_offset"], res["total_lines"]. In filter mode hits == [] means no
-    match; in page mode hits is always [] (read res["query"] to distinguish).
+    Returns a ReadResult (a frozen dataclass that str()s as the payload):
+    .lines (tuple of Line), .hits (matched 1-based line numbers), .windows
+    ((start, end) ranges), .payload (the printable lines),
+    .query (the filter that ran, or None for a page), .truncated,
+    .next_offset, .total_lines. In filter mode hits == () means no
+    match; in page mode hits is always () (read .query to distinguish).
     Raises UsageError on malformed or incompatible arguments.
     """
     if pattern is not None and grep is not None:
@@ -353,7 +396,7 @@ def window(m: Match, before: int = 0, after: int = 0,
     Each hit is widened to [hit - before, hit + after]; windows that overlap or
     touch are merged, so scattered hits do not drag in the lines between them.
     before and after need not be equal. Returns the same ReadResult as
-    read_file(): res["lines"] carry their true line numbers, so anchors stay
+    read_file(): .lines carry their true line numbers, so anchors stay
     valid across the gaps. Raises UsageError if before/after is negative.
     """
     if before < 0 or after < 0:
@@ -387,15 +430,16 @@ def _records(lines: Sequence[str], indices: Iterable[int]) -> list[Line]:
     return [Line(i + 1, hash_line(lines[i], i + 1), lines[i]) for i in indices]
 
 
-def _result(records: Sequence[Line], hits: list[int],
-            windows: list[tuple[int, int]], total: int, truncated: bool,
+def _result(records: Sequence[Line], hits: Iterable[int],
+            windows: Iterable[tuple[int, int]], total: int, truncated: bool,
             next_offset: int | None, plain: bool, query: str | None) -> ReadResult:
     """Assemble a ReadResult from records plus its metadata."""
-    payload = ([r.text for r in records] if plain else
-               ["%d#%s|%s" % (r.ln, r.digest, r.text) for r in records])
-    return ReadResult(ok=True, lines=list(records), hits=hits, windows=windows,
-                      payload=payload, truncated=truncated,
-                      next_offset=next_offset, total_lines=total, query=query)
+    payload = tuple(r.text for r in records) if plain else \
+        tuple("%d#%s|%s" % (r.ln, r.digest, r.text) for r in records)
+    return ReadResult(ok=True, lines=tuple(records), hits=tuple(hits),
+                      windows=tuple(windows), payload=payload,
+                      truncated=truncated, next_offset=next_offset,
+                      total_lines=total, query=query)
 
 
 # --------------------------------------------------------------------------
@@ -416,7 +460,7 @@ def _validate_anchor(lines, anchor):
     return ln - 1
 
 
-def replace(path: str, anchor: str, new_lines: str | Sequence[str], end_anchor: str | None = None, preview: bool = False) -> dict[str, Any]:
+def replace(path: str, anchor: str, new_lines: str | Sequence[str], end_anchor: str | None = None, preview: bool = False) -> EditResult:
     """Replace the line(s) at anchor (through end_anchor, inclusive)."""
     lines, ending = read_lines(path)
     idx = _validate_anchor(lines, anchor)
@@ -436,16 +480,16 @@ def replace(path: str, anchor: str, new_lines: str | Sequence[str], end_anchor: 
     old = list(lines)
     lines[idx:end_idx + 1] = new_lines
     if preview:
-        return {"ok": True, "preview": True,
-                "diff": _unified_diff(path, old, lines),
-                "first_changed_line": idx + 1,
-                "last_changed_line": idx + len(new_lines)}
+        return EditResult(ok=True, preview=True,
+                          diff=_unified_diff(path, old, lines),
+                          first_changed_line=idx + 1,
+                          last_changed_line=idx + len(new_lines))
     write_lines_atomic(path, lines, ending)
-    return {"ok": True, "first_changed_line": idx + 1,
-            "last_changed_line": idx + len(new_lines)}
+    return EditResult(ok=True, first_changed_line=idx + 1,
+                      last_changed_line=idx + len(new_lines))
 
 
-def insert(path: str, anchor: str, new_lines: str | Sequence[str], before: bool = False, preview: bool = False) -> dict[str, Any]:
+def insert(path: str, anchor: str, new_lines: str | Sequence[str], before: bool = False, preview: bool = False) -> EditResult:
     """Insert new_lines before or after the anchor line; preview returns a diff without writing."""
     lines, ending = read_lines(path)
     idx = _validate_anchor(lines, anchor)
@@ -458,26 +502,26 @@ def insert(path: str, anchor: str, new_lines: str | Sequence[str], before: bool 
     old = list(lines)
     lines[at:at] = new_lines
     if preview:
-        return {"ok": True, "preview": True,
-                "diff": _unified_diff(path, old, lines),
-                "first_changed_line": at + 1,
-                "last_changed_line": at + len(new_lines)}
+        return EditResult(ok=True, preview=True,
+                          diff=_unified_diff(path, old, lines),
+                          first_changed_line=at + 1,
+                          last_changed_line=at + len(new_lines))
     write_lines_atomic(path, lines, ending)
-    return {"ok": True, "first_changed_line": at + 1,
-            "last_changed_line": at + len(new_lines)}
+    return EditResult(ok=True, first_changed_line=at + 1,
+                      last_changed_line=at + len(new_lines))
 
 
-def delete(path: str, anchor: str, end_anchor: str | None = None, preview: bool = False) -> dict[str, Any]:
+def delete(path: str, anchor: str, end_anchor: str | None = None, preview: bool = False) -> EditResult:
     """Delete the line(s) at anchor (through end_anchor, inclusive)."""
     return replace(path, anchor, [], end_anchor=end_anchor, preview=preview)
 
 
-def _stale(anchor):
-    return {"ok": False, "error": "stale",
-            "message": "anchor %s: stale" % anchor}
+def _stale(anchor: str) -> EditResult:
+    return EditResult(ok=False, error="stale",
+                      message="anchor %s: stale" % anchor)
 
 
-def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> dict[str, Any]:
+def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> EditResult:
     """Apply multiple edits atomically. All anchors and edit keys are
     validated first; an unknown key is a validation error, not ignored."""
     lines, ending = read_lines(path)
@@ -485,22 +529,22 @@ def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> dict[str, 
     for e in edits:
         unknown = set(e) - _EDIT_KEYS
         if unknown:
-            return {"ok": False, "error": "validation",
-                    "message": "unknown key(s) %s (want %s)"
-                               % (", ".join(sorted(repr(k) for k in unknown)),
-                                  "|".join(sorted(_EDIT_KEYS)))}
+            return EditResult(ok=False, error="validation",
+                              message="unknown key(s) %s (want %s)"
+                                      % (", ".join(sorted(repr(k) for k in unknown)),
+                                         "|".join(sorted(_EDIT_KEYS))))
         op = e.get("op")
         if op not in ("replace", "insert", "delete"):
-            return {"ok": False, "error": "validation",
-                    "message": "unknown op %r (want replace|insert|delete)" % (op,)}
+            return EditResult(ok=False, error="validation",
+                              message="unknown op %r (want replace|insert|delete)" % (op,))
         before = e.get("before", False)
         if before and op != "insert":
-            return {"ok": False, "error": "validation",
-                    "message": "'before' is only valid for insert edits"}
+            return EditResult(ok=False, error="validation",
+                              message="'before' is only valid for insert edits")
         anchor = e.get("anchor")
         if not anchor:
-            return {"ok": False, "error": "validation",
-                    "message": "edit missing 'anchor'"}
+            return EditResult(ok=False, error="validation",
+                              message="edit missing 'anchor'")
         idx = _validate_anchor(lines, anchor)
         if idx is None:
             return _stale(anchor)
@@ -514,8 +558,8 @@ def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> dict[str, 
         if op in ("replace", "insert"):
             raw = e.get("lines", e.get("new_text"))
             if raw is None:
-                return {"ok": False, "error": "validation",
-                        "message": "%s edit missing 'lines' (or 'new_text')" % op}
+                return EditResult(ok=False, error="validation",
+                              message="%s edit missing 'lines' (or 'new_text')" % op)
             if isinstance(raw, str):
                 raw = raw.split("\n")
             new_lines = [nl.rstrip("\r\n") for nl in raw]
@@ -546,13 +590,13 @@ def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> dict[str, 
     else:
         first = last = 0
     if preview:
-        return {"ok": True, "preview": True,
-                "diff": _unified_diff(path, old, lines),
-                "first_changed_line": first, "last_changed_line": last,
-                "edits_applied": len(prepared)}
+        return EditResult(ok=True, preview=True,
+                          diff=_unified_diff(path, old, lines),
+                          first_changed_line=first, last_changed_line=last,
+                          edits_applied=len(prepared))
     write_lines_atomic(path, lines, ending)
-    return {"ok": True, "first_changed_line": first, "last_changed_line": last,
-            "edits_applied": len(prepared)}
+    return EditResult(ok=True, first_changed_line=first, last_changed_line=last,
+                      edits_applied=len(prepared))
 
 
 # --------------------------------------------------------------------------
@@ -568,28 +612,25 @@ def _read_args(parser, args):
     except UsageError as e:
         print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
         return 2
-    except UsageError as e:
-        print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
-        return 2
     except Exception as e:
         print(json.dumps({"ok": False, "error": "io", "message": str(e)}))
         return 1
     if args.json:
         print(json.dumps({"ok": True, "file": path,
-                          "lines": [{"line": l.ln, "anchor": l.anchor, "text": l.text}
-                                    for l in res["lines"]],
-                          "hits": res["hits"], "windows": res["windows"],
-                          "query": res["query"],
-                          "truncated": res["truncated"],
-                          "next_offset": res["next_offset"],
-                          "total_lines": res["total_lines"]}))
+                          "lines": [{"line": item.ln, "anchor": item.anchor, "text": item.text}
+                                    for item in res.lines],
+                          "hits": res.hits, "windows": res.windows,
+                          "query": res.query,
+                          "truncated": res.truncated,
+                          "next_offset": res.next_offset,
+                          "total_lines": res.total_lines}))
     else:
-        for ln in res["payload"]:
+        for ln in res.payload:
             print(ln)
-        if not res["payload"] and (args.pattern is not None or args.grep is not None):
+        if not res.payload and (args.pattern is not None or args.grep is not None):
             print("# no matches", file=sys.stderr)
-        if res["truncated"]:
-            print("# ... truncated (next offset %d)" % res["next_offset"],
+        if res.truncated:
+            print("# ... truncated (next offset %d)" % res.next_offset,
                   file=sys.stderr)
     return 0
 
@@ -632,12 +673,12 @@ def _write_cmd(parser, args, op):
         return 1
     if preview:
         if as_json:
-            print(json.dumps(res))
+            print(json.dumps(res.to_json()))
         else:
-            print(res.get("diff", "") or "(no changes)")
-        return 0 if res.get("ok") else 1
-    print(json.dumps(res))
-    return 0 if res.get("ok") else 1
+            print(res.diff or "(no changes)")
+        return 0 if res.ok else 1
+    print(json.dumps(res.to_json()))
+    return 0 if res.ok else 1
 
 
 def _batch_cmd(parser, args):
@@ -650,12 +691,12 @@ def _batch_cmd(parser, args):
         return 1
     if getattr(args, "preview", False):
         if getattr(args, "json", False):
-            print(json.dumps(res))
+            print(json.dumps(res.to_json()))
         else:
-            print(res.get("diff", "") or "(no changes)")
-        return 0 if res.get("ok") else 1
-    print(json.dumps(res))
-    return 0 if res.get("ok") else 1
+            print(res.diff or "(no changes)")
+        return 0 if res.ok else 1
+    print(json.dumps(res.to_json()))
+    return 0 if res.ok else 1
 
 
 def _selftest():
@@ -692,9 +733,9 @@ def _selftest():
 
     _ow(p, "one\ntwo\nthree\n")
     res = read_file(p)
-    a2 = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])  # line 2 anchor
+    a2 = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)  # line 2 anchor
     r = replace(p, a2, ["TWO"])
-    check("replace ok", r.get("ok") is True)
+    check("replace ok", r.ok is True)
     with open(p) as f:
         check("replace content", f.read() == "one\nTWO\nthree\n")
 
@@ -702,12 +743,12 @@ def _selftest():
     # line; historically it was iterated char-by-char (silent corruption).
     _ow(p, "one\ntwo\nthree\n")
     res = read_file(p)
-    a2 = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])
+    a2 = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)
     replace(p, a2, "TWO-STRING")
     with open(p) as f:
         check("replace str arg = one line", f.read() == "one\nTWO-STRING\nthree\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     insert(p, a1, "ZERO-STRING")  # after anchor 1
     with open(p) as f:
         check("insert str arg = one line", f.read() == "one\nZERO-STRING\nTWO-STRING\nthree\n")
@@ -715,12 +756,12 @@ def _selftest():
     # Stale detection: change file, then old anchor must be rejected
     _ow(p, "one\nCHANGED\nthree\n")
     r = replace(p, a2, ["nope"])
-    check("stale rejected", r.get("ok") is False and r.get("error") == "stale")
+    check("stale rejected", r.ok is False and r.error == "stale")
 
     # Insert before/after
     _ow(p, "one\ntwo\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     insert(p, a1, ["zero"], before=True)
     with open(p) as f:
         check("insert before", f.read() == "zero\none\ntwo\n")
@@ -728,13 +769,13 @@ def _selftest():
     # Batch atomicity: one stale edit -> nothing applied
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
-    a3 = "%d#%s" % (res["lines"][2][0], res["lines"][2][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
+    a3 = "%d#%s" % (res.lines[2].ln, res.lines[2].digest)
     # Corrupt line 3
     _ow(p, "a\nb\nCORRUPT\n")
     r = batch(p, [{"op": "replace", "anchor": a1, "lines": ["A"]},
                   {"op": "replace", "anchor": a3, "lines": ["C"]}])
-    check("batch stale aborts all", r.get("error") == "stale")
+    check("batch stale aborts all", r.error == "stale")
     with open(p) as f:
         check("batch left file untouched", f.read() == "a\nb\nCORRUPT\n")
 
@@ -744,7 +785,7 @@ def _selftest():
     # CLI delete path (regression: delete used to crash on missing new_text)
     _ow(p, "x\ny\nz\n")
     res = read_file(p)
-    ay = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])
+    ay = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)
     fake = argparse.Namespace(file=p, anchor=ay, end_anchor=None,
                               new_text=None, file_input=None)
     check("delete CLI path", _write_cmd(argparse.ArgumentParser(), fake, "delete") == 0)
@@ -754,116 +795,116 @@ def _selftest():
     # Batch: new_text string alias works
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     r = batch(p, [{"op": "replace", "anchor": a1, "new_text": "A1\nA2"}])
-    check("batch new_text alias", r.get("ok") is True)
+    check("batch new_text alias", r.ok is True)
     with open(p) as f:
         check("batch new_text content", f.read() == "A1\nA2\nb\nc\n")
 
     # Batch: missing lines on replace -> validation error, NOT silent delete
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     r = batch(p, [{"op": "replace", "anchor": a1}])
     check("batch missing lines rejected",
-          r.get("ok") is False and r.get("error") == "validation")
+          r.ok is False and r.error == "validation")
     with open(p) as f:
         check("batch no silent delete", f.read() == "a\nb\nc\n")
 
     # Batch: unknown op rejected
     r = batch(p, [{"op": "frobnicate", "anchor": a1, "lines": ["Q"]}])
     check("batch unknown op rejected",
-          r.get("ok") is False and r.get("error") == "validation")
+          r.ok is False and r.error == "validation")
 
     # Batch: unknown key rejected (never silently ignored)
     r = batch(p, [{"op": "replace", "anchor": a1, "lines": ["Q"], "befor": True}])
     check("batch unknown key rejected",
-          r.get("ok") is False and r.get("error") == "validation")
+          r.ok is False and r.error == "validation")
     with open(p) as f:
         check("batch unknown key wrote nothing", f.read() == "a\nb\nc\n")
 
     # Batch: insert-before honored
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a3 = "%d#%s" % (res["lines"][2][0], res["lines"][2][1])
+    a3 = "%d#%s" % (res.lines[2].ln, res.lines[2].digest)
     r = batch(p, [{"op": "insert", "anchor": a3, "lines": ["before-c"], "before": True}])
-    check("batch insert-before ok", r.get("ok") is True)
+    check("batch insert-before ok", r.ok is True)
     with open(p) as f:
         check("batch insert-before content", f.read() == "a\nb\nbefore-c\nc\n")
 
     # Batch: insert still defaults to after (unchanged behavior)
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     r = batch(p, [{"op": "insert", "anchor": a1, "lines": ["after-a"]}])
-    check("batch insert-after default ok", r.get("ok") is True)
+    check("batch insert-after default ok", r.ok is True)
     with open(p) as f:
         check("batch insert-after default content", f.read() == "a\nafter-a\nb\nc\n")
 
     # Batch: 'before' on a non-insert op rejected
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     r = batch(p, [{"op": "delete", "anchor": a1, "before": True}])
     check("batch before on non-insert rejected",
-          r.get("ok") is False and r.get("error") == "validation")
+          r.ok is False and r.error == "validation")
     with open(p) as f:
         check("batch before-invalid wrote nothing", f.read() == "a\nb\nc\n")
 
     # --- patch-preview ---
     _ow(p, "one\ntwo\nthree\n")
     res = read_file(p)
-    a2 = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])
+    a2 = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)
     r = replace(p, a2, ["TWO", "2.5"], preview=True)
-    check("preview replace ok", r.get("ok") is True and r.get("preview") is True)
-    check("preview replace diff -two", "-two\n" in r.get("diff", ""))
-    check("preview replace diff +TWO", "+TWO\n" in r.get("diff", ""))
+    check("preview replace ok", r.ok is True and r.preview is True)
+    check("preview replace diff -two", "-two\n" in (r.diff or ""))
+    check("preview replace diff +TWO", "+TWO\n" in (r.diff or ""))
     with open(p) as f:
         check("preview replace wrote nothing", f.read() == "one\ntwo\nthree\n")
 
     _ow(p, "one\ntwo\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     r = insert(p, a1, ["zero"], before=True, preview=True)
-    check("preview insert ok", r.get("ok") is True)
-    check("preview insert diff +zero", "+zero\n" in r.get("diff", ""))
+    check("preview insert ok", r.ok is True)
+    check("preview insert diff +zero", "+zero\n" in (r.diff or ""))
     with open(p) as f:
         check("preview insert wrote nothing", f.read() == "one\ntwo\n")
 
     _ow(p, "one\ntwo\nthree\n")
     res = read_file(p)
-    a2 = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])
+    a2 = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)
     r = delete(p, a2, preview=True)
-    check("preview delete ok", r.get("ok") is True)
-    check("preview delete diff -two", "-two\n" in r.get("diff", ""))
+    check("preview delete ok", r.ok is True)
+    check("preview delete diff -two", "-two\n" in (r.diff or ""))
     with open(p) as f:
         check("preview delete wrote nothing", f.read() == "one\ntwo\nthree\n")
 
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
-    a3 = "%d#%s" % (res["lines"][2][0], res["lines"][2][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
+    a3 = "%d#%s" % (res.lines[2].ln, res.lines[2].digest)
     r = batch(p, [{"op": "replace", "anchor": a1, "lines": ["A"]},
                   {"op": "insert", "anchor": a3, "lines": ["d"]}], preview=True)
-    check("preview batch ok", r.get("ok") is True and r.get("edits_applied") == 2)
-    check("preview batch diff +A", "+A\n" in r.get("diff", ""))
-    check("preview batch diff +d", "+d\n" in r.get("diff", ""))
+    check("preview batch ok", r.ok is True and r.edits_applied == 2)
+    check("preview batch diff +A", "+A\n" in (r.diff or ""))
+    check("preview batch diff +d", "+d\n" in (r.diff or ""))
     with open(p) as f:
         check("preview batch wrote nothing", f.read() == "a\nb\nc\n")
 
     _ow(p, "a\nb\nc\n")
     res = read_file(p)
-    a1 = "%d#%s" % (res["lines"][0][0], res["lines"][0][1])
+    a1 = "%d#%s" % (res.lines[0].ln, res.lines[0].digest)
     _ow(p, "X\nb\nc\n")
     r = batch(p, [{"op": "replace", "anchor": a1, "lines": ["A"]}], preview=True)
-    check("preview stale rejected", r.get("ok") is False and r.get("error") == "stale")
+    check("preview stale rejected", r.ok is False and r.error == "stale")
     with open(p) as f:
         check("preview stale wrote nothing", f.read() == "X\nb\nc\n")
 
     # CLI preview path (regression guard for _write_cmd wiring)
     _ow(p, "one\ntwo\n")
     res = read_file(p)
-    a2 = "%d#%s" % (res["lines"][1][0], res["lines"][1][1])
+    a2 = "%d#%s" % (res.lines[1].ln, res.lines[1].digest)
     fake = argparse.Namespace(file=p, anchor=a2, end_anchor=None, new_text="TWO",
                               file_input=None, before=False, preview=True, json=False)
     check("CLI preview rc", _write_cmd(argparse.ArgumentParser(), fake, "replace") == 0)
@@ -873,17 +914,17 @@ def _selftest():
     # --- read_file: pattern regex, hits/windows, ReadResult self-rendering ---
     _ow(p, "import os\ndef alpha():\n    return 1\n\nx = 10\ny = 20\ndef beta():\n    return 2\n\n")
     r1 = read_file(p, pattern=r"^def ")
-    check("pattern hits", r1["hits"] == [2, 7])
-    check("pattern no context = hit lines", [l.ln for l in r1["lines"]] == [2, 7])
-    check("grep literal still works", read_file(p, grep="def")["hits"] == [2, 7])
+    check("pattern hits", r1.hits == (2, 7))
+    check("pattern no context = hit lines", [row.ln for row in r1.lines] == [2, 7])
+    check("grep literal still works", read_file(p, grep="def").hits == (2, 7))
     r2 = read_file(p, pattern=r"^def ", context=1)
-    check("context windows skip gap", r2["windows"] == [(1, 3), (6, 8)])
-    check("touching windows merge", read_file(p, pattern=r"^def ", context=2)["windows"] == [(1, 9)])
-    check("str(ReadResult) = payload", str(r2) == "\n".join(r2["payload"]))
-    check("ReadResult is dict", isinstance(r2, dict) and r2["total_lines"] == 9)
+    check("context windows skip gap", r2.windows == ((1, 3), (6, 8)))
+    check("touching windows merge", read_file(p, pattern=r"^def ", context=2).windows == ((1, 9),))
+    check("str(ReadResult) = payload", str(r2) == "\n".join(r2.payload))
+    check("ReadResult frozen dataclass", isinstance(r2, ReadResult) and r2.total_lines == 9)
 
     # Line renders as a usable anchor, never just a hash
-    ln0 = r1["lines"][0]
+    ln0 = r1.lines[0]
     check("Line repr is anchored",
           repr(ln0) == str(ln0) == "%d#%s|%s" % (ln0.ln, ln0.digest, ln0.text))
     check("Line.anchor composes", ln0.anchor == "%d#%s" % (ln0.ln, ln0.digest))
@@ -894,24 +935,24 @@ def _selftest():
     m2 = match(p, grep="def")
     check("match fields", m2.path == p and m2.hits == [2, 7] and m2.query.startswith("grep="))
     w2 = window(m2, before=1, after=1)
-    check("window merges", w2["windows"] == [(1, 3), (6, 8)])
-    check("window renders", str(w2) == "\n".join(w2["payload"]))
+    check("window merges", w2.windows == ((1, 3), (6, 8)))
+    check("window renders", str(w2) == "\n".join(w2.payload))
 
     # no-match is explicit
     rn = read_file(p, pattern=r"zzz_nope")
     check("no match: empty hits/lines/windows",
-          rn["hits"] == [] and rn["lines"] == [] and rn["windows"] == [])
+          rn.hits == () and rn.lines == () and rn.windows == ())
     check("no match: not truncated, no next",
-          rn["truncated"] is False and rn["next_offset"] is None)
+          rn.truncated is False and rn.next_offset is None)
     check("no match renders sentinel", str(rn) == "# no matches for pattern='zzz_nope'")
 
-    # res["query"] disambiguates "filter matched nothing" from "this was a page"
+    # .query disambiguates "filter matched nothing" from "this was a page"
     page = read_file(p, offset=1, limit=2)
-    check("page: query None, hits []", page["query"] is None and page["hits"] == [])
-    check("page: windows is the page range", page["windows"] == [(1, 2)])
-    check("filter: query set on no match", rn["query"] is not None)
-    check("query survives dict()/copy",
-          dict(rn).get("query") == rn["query"] and dict(page).get("query") is None)
+    check("page: query None, hits ()", page.query is None and page.hits == ())
+    check("page: windows is the page range", page.windows == ((1, 2),))
+    check("filter: query set on no match", rn.query is not None)
+    check("query survives copy",
+          asdict(rn)["query"] == rn.query and asdict(page)["query"] is None)
 
     # usage errors are UsageError (-> CLI "usage"), not generic errors
     for name, fn in [
@@ -932,7 +973,7 @@ def _selftest():
 
     # a Line's anchor round-trips straight into an edit
     rr = replace(p, ln0.anchor, ["# replaced"])
-    check("Line.anchor round-trips into replace", rr.get("ok") is True)
+    check("Line.anchor round-trips into replace", rr.ok is True)
     with open(p) as f:
         check("Line.anchor replace content", f.read().split("\n")[1] == "# replaced")
 

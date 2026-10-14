@@ -20,10 +20,13 @@ Options:
 
 Python API:
   import websearch
-  results = websearch.search("python http server", num=5)
+  results = websearch.search("python http server", num=5)   # auto: round-robin
   for r in results:
       print(r["title"], r["url"])
       print(r["snippet"])
+  websearch.search_ddg("python http server")    # one named engine, same result shape
+  websearch.search_bing("python http server")
+  websearch.search_mojeek("python http server")
 """
 
 import argparse
@@ -34,16 +37,37 @@ import os
 import sys
 import time
 import urllib.parse
+from enum import StrEnum
+from typing import TypedDict
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
 
+import fio
 import webfetch
 
 SEARCH_URL = "https://html.duckduckgo.com/html/?q=%s"
 BING_URL = "https://www.bing.com/search?q=%s&setlang=en&count=%d"
 MOJEEK_URL = "https://www.mojeek.com/search?q=%s"
 
-ENGINE_LIST = ["ddg", "bing", "mojeek"]
+
+class Engine(StrEnum):
+    """One search backend; the value is the engine's name in cache keys."""
+    DDG = "ddg"
+    BING = "bing"
+    MOJEEK = "mojeek"
+
+
+class SearchResult(TypedDict):
+    """One search hit (the stored/wire shape: results are cached as JSON)."""
+    title: str
+    url: str
+    snippet: str
+
+
+ENGINE_LIST: tuple[Engine, ...] = (Engine.DDG, Engine.BING, Engine.MOJEEK)
+
+__all__ = ["Engine", "SearchResult", "decode_ddg_url", "decode_bing_url",
+           "search", "search_ddg", "search_bing", "search_mojeek", "main"]
 
 # Local cache + DDG cooldown (be sparse with the web!).
 CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -97,50 +121,18 @@ def decode_bing_url(href: str) -> str:
     return href
 
 
-def _class_has(node, token):
-    cls = node.attrs.get("class", "")
-    return token in cls.split()
-
-
-def _find_all(node, tag=None, class_token=None):
-    """Depth-first search for nodes by tag and/or class token."""
-    found = []
-    for child in node.children:
-        if child.tag is not None:
-            if (tag is None or child.tag == tag) and (class_token is None or _class_has(child, class_token)):
-                found.append(child)
-            found.extend(_find_all(child, tag, class_token))
-    return found
-
-
-def _text(node):
-    """All text under a node (no markdown)."""
-    parts = []
-    if node.tag is None:
-        return node.text
-    for child in node.children:
-        parts.append(_text(child))
-    return "".join(parts)
-
-
-def _cache_key(query, num, engine):
-    h = hashlib.sha256(("%s|%d|%s" % (query, num, engine)).encode("utf-8"))
+def _cache_key(query: str, num: int, engine: "Engine | None") -> str:
+    h = hashlib.sha256(("%s|%d|%s" % (query, num, engine or "auto")).encode("utf-8"))
     return h.hexdigest()[:24]
 
 
 def _atomic_write(path, text):
-    """Write text atomically: write a .new file, then os.replace().
-
-    The sandbox denies plain 'w' overwrites of existing files (Errno 13),
-    so we always write a fresh file and swap it in (per AGENTS.md).
-    """
+    """Write text atomically (fio.atomic_write's mechanism); warn and return
+    False on failure -- a cache miss is never worth failing the search over."""
     try:
-        tmp = path + ".new"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
+        fio.atomic_write(path, text)
         return True
-    except Exception as e:
+    except OSError as e:
         print("websearch: warning: could not write %s: %s" % (path, e),
               file=sys.stderr)
         return False
@@ -155,13 +147,7 @@ def _cache_load():
 
 
 def _cache_save(cache):
-    try:
-        tmp = CACHE_PATH + ".new"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-        os.replace(tmp, CACHE_PATH)
-    except Exception as e:
-        print("websearch: warning: could not write cache: %s" % e, file=sys.stderr)
+    _atomic_write(CACHE_PATH, json.dumps(cache))
 
 
 def _cache_get(cache, key, ttl):
@@ -184,13 +170,17 @@ def _ddg_set_cooldown():
     _atomic_write(COOLDOWN_PATH, str(time.time()))
 
 
-def search_ddg(query: str, num: int = 5, timeout: float = 30, verbose: bool = False) -> list[dict[str, str]]:
+def search_ddg(query: str, num: int = 5, timeout: float = 30, verbose: bool = False, use_cache: bool = True, cache_ttl: int = CACHE_TTL) -> list[SearchResult]:
     """Search DuckDuckGo's HTML endpoint. Raises RuntimeError on bot-block."""
+    return _search_cached(Engine.DDG, query, num, timeout, verbose, use_cache, cache_ttl)
+
+
+def _ddg(query: str, num: int, timeout: float, verbose: bool) -> list[SearchResult]:
     url = SEARCH_URL % urllib.parse.quote_plus(query.strip())
     if verbose:
         print("websearch: ddg fetching %s" % url, file=sys.stderr)
 
-    result = webfetch.webfetch(url, format="html", timeout=timeout, verbose=verbose)
+    result = webfetch.fetch_html(url, timeout=timeout, verbose=verbose)
     if result["status"] != 200:
         raise RuntimeError("DuckDuckGo returned HTTP %d" % result["status"])
     html = result["output"]
@@ -202,42 +192,40 @@ def search_ddg(query: str, num: int = 5, timeout: float = 30, verbose: bool = Fa
 
     # Each result is a <div class="result ..."> containing a.result__a (title)
     # and a.result__snippet (snippet). Group by the result container.
-    results = []
+    results: list[SearchResult] = []
     seen = set()
-    for container in _find_all(tree, tag="div", class_token="result"):
-        a_link = None
-        snippet = None
-        for a in _find_all(container, tag="a"):
-            if a_link is None and _class_has(a, "result__a"):
-                a_link = a
-            if snippet is None and _class_has(a, "result__snippet"):
-                snippet = a
-            if a_link and snippet:
-                break
-        if a_link is None:
+    for container in webfetch.find_all(tree, "div", "result"):
+        links = webfetch.find_all(container, "a", "result__a")
+        if not links:
             continue
-        title = _text(a_link).strip()
+        a_link = links[0]
+        snips = webfetch.find_all(container, "a", "result__snippet")
+        title = webfetch.text_of(a_link).strip()
         href = a_link.attrs.get("href", "")
         real_url = decode_ddg_url(href)
-        snip = _text(snippet).strip() if snippet else ""
+        snip = webfetch.text_of(snips[0]).strip() if snips else ""
         if real_url in seen:
             continue
         seen.add(real_url)
-        results.append({"title": title, "url": real_url, "snippet": snip})
+        results.append(SearchResult(title=title, url=real_url, snippet=snip))
         if len(results) >= num:
             break
 
     return results
 
 
-def search_bing(query: str, num: int = 5, timeout: float = 30, verbose: bool = False) -> list[dict[str, str]]:
-    """Search Bing. Returns a list of dicts (same shape as search_ddg)."""
+def search_bing(query: str, num: int = 5, timeout: float = 30, verbose: bool = False, use_cache: bool = True, cache_ttl: int = CACHE_TTL) -> list[SearchResult]:
+    """Search Bing. Returns the same result shape as search_ddg."""
+    return _search_cached(Engine.BING, query, num, timeout, verbose, use_cache, cache_ttl)
+
+
+def _bing(query: str, num: int, timeout: float, verbose: bool) -> list[SearchResult]:
     import re
     url = BING_URL % (urllib.parse.quote_plus(query.strip()), min(max(num, 1), 30))
     if verbose:
         print("websearch: bing fetching %s" % url, file=sys.stderr)
 
-    result = webfetch.webfetch(url, format="html", timeout=timeout, verbose=verbose)
+    result = webfetch.fetch_html(url, timeout=timeout, verbose=verbose)
     if result["status"] != 200:
         raise RuntimeError("Bing returned HTTP %d" % result["status"])
     html = result["output"]
@@ -261,21 +249,25 @@ def search_bing(query: str, num: int = 5, timeout: float = 30, verbose: bool = F
         if real_url in seen:
             continue
         seen.add(real_url)
-        results.append({"title": title, "url": real_url, "snippet": snip})
+        results.append(SearchResult(title=title, url=real_url, snippet=snip))
         if len(results) >= num:
             break
 
     return results
 
 
-def search_mojeek(query: str, num: int = 5, timeout: float = 30, verbose: bool = False) -> list[dict[str, str]]:
+def search_mojeek(query: str, num: int = 5, timeout: float = 30, verbose: bool = False, use_cache: bool = True, cache_ttl: int = CACHE_TTL) -> list[SearchResult]:
     """Search Mojeek. Direct result URLs, no redirect decoding needed."""
+    return _search_cached(Engine.MOJEEK, query, num, timeout, verbose, use_cache, cache_ttl)
+
+
+def _mojeek(query: str, num: int, timeout: float, verbose: bool) -> list[SearchResult]:
     import re
     url = MOJEEK_URL % urllib.parse.quote_plus(query.strip())
     if verbose:
         print("websearch: mojeek fetching %s" % url, file=sys.stderr)
 
-    result = webfetch.webfetch(url, format="html", timeout=timeout, verbose=verbose)
+    result = webfetch.fetch_html(url, timeout=timeout, verbose=verbose)
     if result["status"] != 200:
         raise RuntimeError("Mojeek returned HTTP %d" % result["status"])
     html = result["output"]
@@ -298,20 +290,21 @@ def search_mojeek(query: str, num: int = 5, timeout: float = 30, verbose: bool =
         if href in seen:
             continue
         seen.add(href)
-        results.append({"title": title, "url": href, "snippet": snip})
+        results.append(SearchResult(title=title, url=href, snippet=snip))
         if len(results) >= num:
             break
 
     return results
 
 
-def _search_one(engine, query, num, timeout, verbose):
-    if engine == "ddg":
-        return search_ddg(query, num=num, timeout=timeout, verbose=verbose)
-    if engine == "bing":
-        return search_bing(query, num=num, timeout=timeout, verbose=verbose)
-    if engine == "mojeek":
-        return search_mojeek(query, num=num, timeout=timeout, verbose=verbose)
+def _search_one(engine: Engine, query: str, num: int, timeout: float, verbose: bool) -> list[SearchResult]:
+    """Run one named backend's parse path (no cache; the callers own caching)."""
+    if engine is Engine.DDG:
+        return _ddg(query, num, timeout, verbose)
+    if engine is Engine.BING:
+        return _bing(query, num, timeout, verbose)
+    if engine is Engine.MOJEEK:
+        return _mojeek(query, num, timeout, verbose)
     raise ValueError("unknown engine: %r" % engine)
 
 
@@ -327,17 +320,24 @@ def _rr_next():
     return nxt
 
 
-def search(query: str, num: int = 5, timeout: float = 30, verbose: bool = False, engine: str = "auto", use_cache: bool = True, cache_ttl: int = CACHE_TTL) -> list[dict[str, str]]:
-    """Search the web and return a list of dicts:
+def search(query: str, num: int = 5, timeout: float = 30, verbose: bool = False, use_cache: bool = True, cache_ttl: int = CACHE_TTL) -> list[SearchResult]:
+    """Search the web and return a list of SearchResult dicts:
     [{"title": str, "url": str, "snippet": str}, ...]
 
-    engine: "auto" (round-robin across ddg -> bing -> mojeek, rotating
-            the start engine each call), or force one: "ddg", "bing",
-            "mojeek".
+    Auto mode: round-robin across ddg -> bing -> mojeek, rotating the start
+    engine each call and skipping ddg for a cooldown period after a 202
+    bot-block. To force one backend, call its own verb instead:
+    search_ddg / search_bing / search_mojeek.
     Results are cached on disk (TTL cache_ttl seconds) so repeated searches
-    don't hit the network. After a DDG 202 bot-block, auto mode skips DDG
-    for a cooldown period.
+    don't hit the network.
     """
+    return _search_cached(None, query, num, timeout, verbose, use_cache, cache_ttl)
+
+
+def _search_cached(engine: "Engine | None", query: str, num: int, timeout: float,
+                   verbose: bool, use_cache: bool, cache_ttl: int) -> list[SearchResult]:
+    """One cached search; engine None means auto round-robin. The public verbs
+    (search, search_ddg/bing/mojeek) wrap this -- the mode lives only here."""
     if not query or not query.strip():
         raise ValueError("query must not be empty")
     num = max(1, min(int(num), 30))
@@ -351,8 +351,8 @@ def search(query: str, num: int = 5, timeout: float = 30, verbose: bool = False,
                 print("websearch: cache hit for %r" % query, file=sys.stderr)
             return cached
 
-    if engine != "auto":
-        # Explicit engine: no round-robin.
+    if engine is not None:
+        # Named engine: no round-robin.
         results = _search_one(engine, query, num, timeout, verbose)
     else:
         # Round-robin: rotate start engine each call, try the rest in order.
@@ -360,7 +360,7 @@ def search(query: str, num: int = 5, timeout: float = 30, verbose: bool = False,
         order = ENGINE_LIST[start:] + ENGINE_LIST[:start]
         last_err = None
         for eng in order:
-            if eng == "ddg" and _ddg_in_cooldown():
+            if eng is Engine.DDG and _ddg_in_cooldown():
                 if verbose:
                     print("websearch: ddg in cooldown; skipping", file=sys.stderr)
                 continue
@@ -369,7 +369,7 @@ def search(query: str, num: int = 5, timeout: float = 30, verbose: bool = False,
                 break
             except RuntimeError as e:
                 last_err = e
-                if eng == "ddg":
+                if eng is Engine.DDG:
                     _ddg_set_cooldown()
                 if verbose:
                     print("websearch: %s failed (%s); trying next" % (eng, e),
@@ -434,10 +434,11 @@ def _selftest():
             '<a class="result__snippet" href="#">snip here</a></div>'
             '</body></html>')
     tree = webfetch.parse_html(tiny)
-    divs = _find_all(tree, tag="div", class_token="result")
+    divs = webfetch.find_all(tree, "div", "result")
     check("find result divs", len(divs) == 1)
-    links = _find_all(tree, tag="a", class_token="result__a")
-    check("find result__a links", len(links) == 1 and _text(links[0]) == "X")
+    links = webfetch.find_all(tree, "a", "result__a")
+    check("find result__a links", len(links) == 1 and webfetch.text_of(links[0]) == "X")
+    check("Engine values are the wire names", [e.value for e in Engine] == ["ddg", "bing", "mojeek"])
 
     print("\n%s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
@@ -482,9 +483,9 @@ def main(argv: list[str] | None = None) -> int:
     query = " ".join(args.query)
 
     try:
-        results = search(query, num=args.num, timeout=args.timeout,
-                         verbose=args.verbose, engine=args.engine,
-                         use_cache=not args.no_cache, cache_ttl=args.cache_ttl)
+        engine = None if args.engine == "auto" else Engine(args.engine)
+        results = _search_cached(engine, query, args.num, args.timeout,
+                                 args.verbose, not args.no_cache, args.cache_ttl)
     except Exception as e:
         print("websearch: error: %s" % e, file=sys.stderr)
         return 1
