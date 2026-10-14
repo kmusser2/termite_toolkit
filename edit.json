@@ -3,6 +3,13 @@
     "skills": [],
     "tools": [
         {
+            "init": "src/ansi.py",
+            "files": [
+                "src/ansi.py"
+            ],
+            "root": false
+        },
+        {
             "init": "src/symmap.py",
             "files": [
                 "src/symmap.py"
