@@ -46,9 +46,6 @@ else:
 
 __all__ = ["encode_key", "parse_cmd", "selftest", "main"]
 
-# workspace root (this file lives in <root>/src/)
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 KEYS = {
     'left': b'\x1b[D', 'right': b'\x1b[C', 'up': b'\x1b[A', 'down': b'\x1b[B',
@@ -77,7 +74,7 @@ def selftest() -> int:
     """Verify encode_key/parse_cmd + end-to-end PTY driving (keys, strip, lines,
     timeout, exit code, CLI errors). End-to-end checks need a real PTY and are
     SKIPPED (with a notice) when the sandbox denies /dev/ptmx - an environment
-    limit, not a code failure. Uses tmp/ only."""
+    limit, not a code failure. Uses a system temp dir only."""
     import shutil
     import tempfile
     ok = True
@@ -114,7 +111,7 @@ def selftest() -> int:
         os.close(m)
         os.close(s)
 
-    d = tempfile.mkdtemp(dir=os.path.join(BASE, 'tmp'))
+    d = tempfile.mkdtemp()
     try:
         tool = os.path.abspath(__file__)
         if pty_ok:

@@ -18,7 +18,7 @@ Usage:
   fio.py info <path>              size, mtime, line count
   fio.py find <needle> [path]     grep for needle in file(s)
   fio.py strip-ansi <path>        print file with ANSI escapes removed
-Relative paths resolve to the workspace root (the directory containing src/ and tmp/).
+Relative paths resolve to the current working directory.
   fio.py --selftest               run self tests
 """
 import os
@@ -32,8 +32,8 @@ if __package__:
 else:
     import ansi
 
-# Workspace root (contains src/ and tmp/); relative paths resolve here.
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Relative paths resolve against the current working directory, not this file's
+# location: this tool may be deployed outside the project tree (e.g. /toolkits/edit).
 
 __all__ = ["resolve", "atomic_write", "selftest", "main"]
 
@@ -58,8 +58,8 @@ def atomic_write(path: str, text: str) -> None:
 
 
 def resolve(path: str) -> str:
-    """Resolve a path relative to the workspace root to an absolute path."""
-    p = path if os.path.isabs(path) else os.path.join(BASE, path)
+    """Resolve a path relative to the current working directory to an absolute path."""
+    p = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
     return os.path.normpath(p)
 
 
@@ -71,14 +71,15 @@ def need_args(args: list[str], n: int) -> None:
 
 
 def cmd_list(args: list[str]) -> None:
-    """List files in the workspace, optionally filtered to paths containing pattern."""
+    """List files in the current working directory, optionally filtered to paths containing pattern."""
+    base = os.getcwd()
     pattern = args[0] if args else None
     entries = []
-    for root, dirs, files in os.walk(BASE):
+    for root, dirs, files in os.walk(base):
         # skip nothing; show relative paths
         for f in files:
             full = os.path.join(root, f)
-            rel = os.path.relpath(full, BASE)
+            rel = os.path.relpath(full, base)
             size = os.path.getsize(full)
             entries.append((rel, size))
     entries.sort()
@@ -194,11 +195,12 @@ def cmd_find(args: list[str]) -> None:
     """Grep for a needle across files, printing path:line matches."""
     need_args(args, 1)
     needle = args[0]
+    base = os.getcwd()
     p = resolve(args[1]) if len(args) > 1 else None
     if p is not None and os.path.isfile(p):
         paths = [p]
     else:
-        paths = [os.path.join(r, f) for r, _, fs in os.walk(p or BASE) for f in fs]
+        paths = [os.path.join(r, f) for r, _, fs in os.walk(p or base) for f in fs]
     hits = 0
     for path in paths:
         try:
@@ -209,7 +211,7 @@ def cmd_find(args: list[str]) -> None:
             with open(path, 'r', errors='replace') as f:
                 for i, line in enumerate(f, 1):
                     if needle in line:
-                        rel = os.path.relpath(path, BASE)
+                        rel = os.path.relpath(path, base)
                         print(f"{rel}:{i}: {line.rstrip()}")
                         hits += 1
         except OSError:
@@ -236,7 +238,7 @@ CMDS = {
 
 
 def selftest() -> int:
-    """Verify write (new + overwrite), append, backup, rm. Uses tmp/ only."""
+    """Verify write (new + overwrite), append, backup, rm. Uses a system temp dir only."""
     ok = True
     def check(name, cond):
         nonlocal ok
@@ -245,7 +247,7 @@ def selftest() -> int:
             ok = False
 
     import tempfile
-    d = tempfile.mkdtemp(dir=os.path.join(BASE, 'tmp'))
+    d = tempfile.mkdtemp()
     p = os.path.join(d, 't.txt')
     cmd_write([p, 'hello'])
     check('write new file', open(p).read() == 'hello\n')
@@ -264,7 +266,7 @@ def selftest() -> int:
     cmd_rm([p])
     check('rm', not os.path.exists(p))
     check('resolve relative to workdir',
-          resolve('tmp') == os.path.normpath(os.path.join(BASE, 'tmp')))
+          resolve('tmp') == os.path.normpath(os.path.join(os.getcwd(), 'tmp')))
     shutil.rmtree(d, ignore_errors=True)
     print('\n%s' % ('ALL TESTS PASSED' if ok else 'SOME TESTS FAILED'))
     return 0 if ok else 1

@@ -35,13 +35,13 @@ uncommitted (`main`, no commits) and evolving.
 | `TOOLKIT/` | Seeded **example** tools | `calculator.py`, `current_time.py`, `get_weather.py`; git-ignored |
 | `docs/` | Long-form documentation | `docs/TOOL_AUTHORING.md` (generic tool-authoring contract), `docs/TOOL_AUTHORING_NOTES.md` (how it applies here), `docs/CAPABILITIES.md` (capability manifest schema & rules) |
 | `tests/` | Test scaffolding (**empty**) | Prefer per-module `--selftest` (see *Validating*) |
-| `tmp/` | Scratch space | Ephemeral, throwaway; never commit it |
+| `$TMPDIR` | Scratch space | System temp dir, **outside the repo**; use `tempfile` for scratch, never a repo-local `tmp/` |
 | `pyproject.toml` | Project metadata | `name = "Termite-Toolkit"`, `version = "0.1.0"`, `requires-python = ">=3.11"` |
-| `.gitignore` | Ignores `TOOLKIT/**`, `tmp/`, bytecode, and websearch caches | Caches (`.websearch_cache.json`, `.ddg_cooldown`, `.engine_rr`) are written next to `websearch.py` |
+| `.gitignore` | Ignores `TOOLKIT/**`, bytecode, and websearch caches | Caches (`.websearch_cache.json`, `.ddg_cooldown`, `.engine_rr`) are written next to `websearch.py` |
 
-Prefer **`tmp/`** for any generated artifacts (diffs, reports, compiled
-binaries) so they stay out of version control — e.g. `project_check.py` writes
-reports to `tmp/<name>-check.json` and `diffside.py` examples render into `tmp/`.
+Prefer the system temp dir (**`$TMPDIR`**, via Python's `tempfile`) for throwaway
+artifacts (diffs, reports, compiled binaries): it lives outside the repo, so nothing
+there is ever committed, and no tool depends on a repo-local `tmp/` existing.
 
 ## Tool registry
 
@@ -117,7 +117,7 @@ card in `list_tools()` / `get_tool()`:
 - Whole toolkit: `src/healthcheck.py -q` — probes toolchains, devices, network,
   rlimits, and runs **every** tool's `--selftest` (exit 0 = green).
 - Project checks: `src/project_check.py [--root DIR | --manifest FILE]` runs the
-  commands in a `project-check.json`, saved with `--out tmp/<name>.json` and
+  commands in a `project-check.json`, saved with `--out $TMPDIR/<name>.json` and
   re-rendered later with `--render`. See *project_check.py* below.
 
 ## Cross-references: which tool for what
@@ -175,5 +175,5 @@ These shell helpers ship as payload behind the Python entry `src/envwrap.py`
 - Keep modules **stdlib-only** unless there's a strong reason; if you need a
   package, install it through `src/pip`.
 - One concern per module; expose a small, typed public API plus a CLI.
-- Write artifacts to `tmp/`; keep `TOOLKIT/` caches untracked.
+- Write throwaway artifacts to the system temp dir (`$TMPDIR`, via `tempfile`); keep `TOOLKIT/` caches untracked.
 - Documentation lives in the module docstring; use `docs/` for anything longer.

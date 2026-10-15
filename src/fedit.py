@@ -27,15 +27,15 @@ import sys
 import subprocess
 from typing import Sequence
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+_HERE = os.path.dirname(os.path.abspath(__file__))  # this tool's directory (for the sibling CLI)
 
 
 __all__ = ["resolve", "run_fedit", "selftest", "main"]
 
 
 def resolve(path: str) -> str:
-    """Resolve a path relative to this module's directory to an absolute path."""
-    p = path if os.path.isabs(path) else os.path.join(BASE, path)
+    """Resolve a path relative to the current working directory to an absolute path."""
+    p = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
     return os.path.normpath(p)
 
 
@@ -46,12 +46,12 @@ def run_fedit(path: str, cmds: str | Sequence[str], timeout: float = 15) -> subp
     if isinstance(cmds, (list, tuple)):
         cmds = "\n".join(cmds) + "\n"
     return subprocess.run(
-        [sys.executable, os.path.join(BASE, 'fedit.py'), path],
+        [sys.executable, os.path.join(_HERE, 'fedit.py'), path],
         input=cmds, capture_output=True, text=True, timeout=timeout)
 
 
 def selftest() -> int:
-    """Verify edit commands end-to-end on tmp/ files (scripted stdin)."""
+    """Verify edit commands end-to-end on scratch files (scripted stdin)."""
     import shutil
     import subprocess
     import tempfile
@@ -63,7 +63,7 @@ def selftest() -> int:
         if not cond:
             ok = False
 
-    d = tempfile.mkdtemp(dir=os.path.join(os.path.dirname(BASE), 'tmp'))
+    d = tempfile.mkdtemp()
     try:
         p1 = os.path.join(d, 'a.txt')
         cmds = ('i 1 alpha\n'
@@ -98,7 +98,7 @@ def selftest() -> int:
         r = run_fedit(p1, 'zzz\nq\n')
         check('unknown cmd tolerated', r.returncode == 0)
 
-        rr = subprocess.run([sys.executable, os.path.join(BASE, 'fedit.py'), '-h'],
+        rr = subprocess.run([sys.executable, os.path.join(_HERE, 'fedit.py'), '-h'],
                             capture_output=True, text=True, timeout=5)
         check('-h exits 0 quickly (no hang)', rr.returncode == 0)
 

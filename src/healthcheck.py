@@ -19,19 +19,19 @@ import argparse, glob, os, resource, shutil, socket, subprocess, sys, tempfile, 
 from typing import Sequence
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))  # tool modules live beside this file
-BASE = os.path.dirname(TOOLS_DIR)                       # workspace root (contains src/ and tmp/)
-SCRATCH = os.path.join(BASE, "tmp")                     # probe artifacts go here (per AGENTS.md)
+BASE = os.path.dirname(TOOLS_DIR)                       # workspace root (this file lives in <root>/src/ or <root>/<alias>)
 
 __all__ = ["run", "scratch", "selftest_self", "main"]
 
 
 def scratch() -> str:
-    """Writable scratch dir for probe artifacts (BASE/tmp), created on demand.
+    """Writable scratch dir for probe artifacts: the system temp dir ($TMPDIR).
 
-    Raises OSError when the workspace offers no writable tmp/ -- probe callers
-    turn that into a failed check rather than letting the run crash."""
-    os.makedirs(SCRATCH, exist_ok=True)
-    return SCRATCH
+    Created on demand. Raises OSError when no writable temp dir is available --
+    probe callers turn that into a failed check rather than letting the run crash."""
+    d = tempfile.gettempdir()
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def run(cmd: Sequence[str], timeout: float = 30, input: str | None = None) -> tuple[int | None, str]:
@@ -150,7 +150,7 @@ def selftest_self() -> int:
     rc = c.done()
     assert rc == 1 and len(c.results) == 1 and not c.results[0][1]
     s = scratch()
-    assert os.path.isdir(s) and os.path.commonpath([s, BASE]) == BASE, s
+    assert os.path.isdir(s) and os.access(s, os.W_OK), s
     print("healthcheck.py --selftest PASS (failure detection works)")
     return 0
 

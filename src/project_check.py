@@ -99,7 +99,6 @@ __all__ = ["CheckSpec", "CheckResult", "Counts", "Report", "Status",
            "render_report", "render_table_for_report", "run_check",
            "run_configured_check", "selftest", "main"]
 
-BASE = Path(__file__).resolve().parent.parent
 DEFAULT_TIMEOUT = 120
 MAX_OUTPUT = 4000
 
@@ -276,7 +275,7 @@ def render_report(path: str | Path, color: bool = True) -> int:
 def selftest() -> int:
     """Verify assess/render/table features against a temp manifest (pass, fail, timeout, missing command)."""
     import tempfile
-    with tempfile.TemporaryDirectory(dir=BASE / 'tmp') as d:
+    with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         manifest = d / 'project-check.json'
         atomic_json(manifest, {'project': 'probe', 'checks': [

@@ -21,13 +21,12 @@ import sys
 
 __all__ = ["resolve", "build", "syntax_check", "selftest", "main"]
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # workspace root (this file lives in <root>/src/)
 SELF = os.path.abspath(__file__)  # this module, for CLI self-invocation in the selftest
 
 
 def resolve(p: str) -> str:
-    """Resolve a path relative to the workspace root to an absolute path."""
-    return p if os.path.isabs(p) else os.path.join(BASE, p)
+    """Resolve a path relative to the current working directory to an absolute path."""
+    return p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
 
 
 def _intermediates(src, out):
@@ -66,11 +65,11 @@ def build(compiler: str, std: str, src: str, out: str | None = None) -> int:
 
 def syntax_check(compiler: str, std: str, src: str) -> int:
     """Check that src compiles, producing no binary. Returns the compiler exit code."""
-    # ponytail: compile to a throwaway .o in tmp/ instead of gcc -fsyntax-only,
+    # ponytail: compile to a throwaway .o in the system temp dir instead of gcc -fsyntax-only,
     # because the sandbox denies opening /dev/null for writing (Errno 13);
     # switch to -fsyntax-only if that deny is ever lifted
     import tempfile
-    fd, tmpobj = tempfile.mkstemp(suffix='.o', dir=os.path.join(BASE, 'tmp'))
+    fd, tmpobj = tempfile.mkstemp(suffix='.o')
     os.close(fd)
     os.remove(tmpobj)
     cmd = [compiler, f'-std={std}', '-c', '-Wall', '-Wextra', src, '-o', tmpobj]
@@ -87,7 +86,7 @@ def syntax_check(compiler: str, std: str, src: str) -> int:
 
 def selftest() -> int:
     """Verify compile (fresh, overwrite, c, check, default out), run passthrough,
-    intermediate cleanup, error paths, -h. Uses tmp/ only."""
+    intermediate cleanup, error paths, -h. Uses a system temp dir only."""
     import shutil
     import tempfile
     ok = True
@@ -98,9 +97,9 @@ def selftest() -> int:
         if not cond:
             ok = False
 
-    d = tempfile.mkdtemp(dir=os.path.join(BASE, 'tmp'))
+    d = tempfile.mkdtemp()
     try:
-        check('resolve relative', resolve('tmp') == os.path.join(BASE, 'tmp'))
+        check('resolve relative', resolve('tmp') == os.path.join(os.getcwd(), 'tmp'))
         import contextlib, io
         with contextlib.redirect_stdout(io.StringIO()):
             passed = main(['-h']) == 0

@@ -35,8 +35,8 @@ existing `src/*.py`.
 
 Whether any bare sibling import remains is answered mechanically by the audit
 snippet in briefing section 6, run from the repo root; it currently reports
-clean. That snippet walks `**/*.py`, which here also picks up the git-ignored
-`tmp/`; scope it to `src/` when you want src-only, noise-free output.
+clean. That snippet walks `**/*.py`; scope it to `src/` when you want src-only,
+noise-free output.
 
 ## Applying section 5 (verifying, and example literals)
 
@@ -55,8 +55,8 @@ clean. That snippet walks `**/*.py`, which here also picks up the git-ignored
 ## Repo conventions the briefing does not state
 
 These live in `AGENTS.md`, which is the index; keep them there rather than here:
-stdlib-only modules, one concern per module, generated artifacts to the
-git-ignored `tmp/`, documentation in the module docstring, and adding new tools
+stdlib-only modules, one concern per module, generated artifacts to the system
+temp dir (`$TMPDIR`), documentation in the module docstring, and adding new tools
 to the `AGENTS.md` cross-reference and to a capability manifest.
 
 ## After editing any tool

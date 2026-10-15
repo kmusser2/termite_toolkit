@@ -387,15 +387,15 @@ def _html_page(rows, title, width, sep):
 # public API
 # --------------------------------------------------------------------------
 
-def files(old_lines: Sequence[str], new_lines: Sequence[str], width: int | None = None, sep: str = DEFAULT_SEP, color: bool = True, box: bool = True, old_name: str = "", new_name: str = "") -> str:
-    """Render two files' lines side-by-side as a boxed table; returns the joined rows."""
+def files(old_lines: Sequence[str], new_lines: Sequence[str], width: int | None = None, sep: str = DEFAULT_SEP, color: bool = True, box: bool = True, old_name: str = "", new_name: str = "") -> list[str]:
+    """Render two files' lines side-by-side as a boxed table; returns the rendered rows (a list of strings)."""
     title, rows = _rows_for_files(old_lines, new_lines, old_name, new_name)
     return _render(rows, title, width if width is not None else _default_width(),
                    sep, color, box)
 
 
-def from_unified(diff_text: str, width: int | None = None, sep: str = DEFAULT_SEP, color: bool = True, box: bool = True) -> str:
-    """Render a unified diff string side-by-side; returns the joined rows."""
+def from_unified(diff_text: str, width: int | None = None, sep: str = DEFAULT_SEP, color: bool = True, box: bool = True) -> list[str]:
+    """Render a unified diff string side-by-side; returns the rendered rows (a list of strings)."""
     title, rows = _rows_for_diff(diff_text)
     return _render(rows, title, width if width is not None else _default_width(),
                    sep, color, box)
