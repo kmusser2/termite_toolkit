@@ -3,46 +3,27 @@
     "skills": [],
     "tools": [
         {
-            "init": "src/ansi.py",
-            "files": [
-                "src/ansi.py"
-            ],
-            "root": false
+            "tool": "src/ansi.py"
         },
         {
-            "init": "src/symmap.py",
-            "files": [
-                "src/symmap.py"
-            ],
-            "root": false
+            "tool": "src/symmap.py",
+            "requires": [ "src/ansi.py" ]
         },
         {
-            "init": "src/hedit.py",
-            "files": [
-                "src/hedit.py"
-            ],
-            "root": false
+            "tool": "src/hedit.py",
+            "requires": [ "src/ansi.py" ]
         },
         {
-            "init": "src/fedit.py",
-            "files": [
-                "src/fedit.py"
-            ],
-            "root": false
+            "tool": "src/fedit.py",
+            "requires": [ "src/ansi.py" ]
         },
         {
-            "init": "src/fio.py",
-            "files": [
-                "src/fio.py"
-            ],
-            "root": false
+            "tool": "src/fio.py",
+            "requires": [ "src/ansi.py" ]
         },
         {
-            "init": "src/diffside.py",
-            "files": [
-                "src/diffside.py"
-            ],
-            "root": false
+            "tool": "src/diffside.py",
+            "requires": [ "src/ansi.py" ]
         }
     ]
 }

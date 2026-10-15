@@ -1,57 +1,33 @@
 {
+    "description": "Various tools with unspecified uses.",
     "skills": [],
     "tools": [
         {
-            "init": "src/table.py",
-            "files": [
-                "src/table.py"
-            ],
-            "root": false
+            "tool": "src/table.py"
         },
         {
-            "init": "src/ansi.py",
-            "files": [
-                "src/ansi.py"
-            ],
-            "root": false
+            "tool": "src/ansi.py"
         },
         {
-            "init": "src/pty_run.py",
-            "files": [
-                "src/pty_run.py"
-            ],
-            "root": false
+            "tool": "src/pty_run.py"
         },
         {
-            "init": "src/cronexpr.py",
-            "files": [
-                "src/cronexpr.py"
-            ],
-            "root": false
+            "tool": "src/cronexpr.py"
         },
         {
-            "init": "src/healthcheck.py",
-            "files": [
-                "src/healthcheck.py"
-            ],
-            "root": false
+            "tool": "src/healthcheck.py"
         },
         {
-            "init": "src/project_check.py",
-            "files": [
-                "src/project_check.py"
-            ],
-            "root": false
+            "tool": "src/project_check.py"
         },
         {
-            "init": "src/envwrap.py",
-            "files": [
+            "tool": "src/envwrap.py",
+            "requires": [
                 "src/envwrap.py",
                 "src/envrun",
                 "src/pip",
                 "src/permissions-check.sh"
-            ],
-            "root": false
+            ]
         }
     ]
 }

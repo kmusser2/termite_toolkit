@@ -1,20 +1,12 @@
 {
-    "description": "Convenience tools for c++ development.",    
+    "description": "Convenience tools for c++ development.",
     "skills": [],
     "tools": [
         {
-            "init": "src/clangd.py",
-            "files": [
-                "src/clangd.py"
-            ],
-            "root": false
+            "tool": "src/clangd.py"
         },
         {
-            "init": "src/build.py",
-            "files": [
-                "src/build.py"
-            ],
-            "root": false
+            "tool": "src/build.py"
         }
     ]
 }
