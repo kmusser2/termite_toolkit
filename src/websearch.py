@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """websearch.py - Search the web and print results (DuckDuckGo HTML).
 # keywords: search|web|internet|query|duckduckgo|bing|mojeek|results|snippet|google|lookup|find
-# examples: import websearch; websearch.search("quantum computing", num=5)
+# examples: import $name; $name.search("quantum computing", num=5)
 
 Built on top of webfetch.py (same directory). Queries DuckDuckGo's
 JS-free HTML endpoint and extracts titles, real URLs, and snippets.
@@ -19,14 +19,14 @@ Options:
       --selftest        run built-in offline self tests and exit
 
 Python API:
-  import websearch
-  results = websearch.search("python http server", num=5)   # auto: round-robin
+  import $name
+  results = $name.search("python http server", num=5)   # auto: round-robin
   for r in results:
       print(r["title"], r["url"])
       print(r["snippet"])
-  websearch.search_ddg("python http server")    # one named engine, same result shape
-  websearch.search_bing("python http server")
-  websearch.search_mojeek("python http server")
+  $name.search_ddg("python http server")    # one named engine, same result shape
+  $name.search_bing("python http server")
+  $name.search_mojeek("python http server")
 """
 
 import argparse

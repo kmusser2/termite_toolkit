@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 # keywords: |symbol|outline|map|ast|function|class|method|signature|anchor|python|parse|structure|lines|scope|
-# examples: |import symmap; symmap.parse("service.py")|import symmap; symmap.parse_source("def f(x): return x", "x.py")|import symmap; symmap.register_backend("go", backend_fn, [".go"])|
+# examples: |import $name; $name.parse("service.py")|import $name; $name.parse_source("def f(x): return x", "x.py")|import $name; $name.register_backend("go", backend_fn, [".go"])|
 """symmap.py - Symbol outline map for source files.
 
 Python API (importable from any python_eval call):
-  import symmap
-  r = symmap.parse("service.py")   # ParseResult: every function/class/method
+  import $name
+  r = $name.parse("service.py")   # ParseResult: every function/class/method
                                    # with qualified name, exact signature,
                                    # line range, and a hedit anchor for the
                                    # first line of each symbol.
-  r = symmap.parse_source("def f(x): return x", "x.py")   # in-memory
+  r = $name.parse_source("def f(x): return x", "x.py")   # in-memory
 
 Language backends plug in behind one schema; only the Python backend
 (ast, stdlib-only) ships today.  Adding e.g. C++ later means registering

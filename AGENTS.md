@@ -63,17 +63,45 @@ Follow the house style demonstrated by `TOOLKIT/calculator.py`:
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 # keywords: |a|b|c|
-# examples: |import mytool; mytool.run()|./mytool.py --selftest|
+# examples: |import $name; $name.run()|./mytool.py --selftest|
 """mytool.py - one-line purpose.
 
 Longer description, Python API, and CLI usage.
+
+    import $name
+    $name.run("thing")   # -> Result
 """
 ```
 
-Rules: docstring's **first line is `"<name>.py - <purpose>"`**; public functions
-are **fully type-annotated and documented**; declare shapes with `TypedDict`;
-prefix disallowed helpers with `_`; provide a `--selftest` and a `main(argv)`.
-New tools live in `src/`; add cross-references to them in this file.
+Rules: docstring's **first line is `"<name>.py - <purpose>"`** (the literal
+filename); public functions are **fully type-annotated and documented**; declare
+shapes with `TypedDict`; prefix disallowed helpers with `_`; provide a
+`--selftest` and a `main(argv)`. New tools live in `src/`; add cross-references
+to them in this file.
+
+### `$name` -- how docs name this tool
+
+The rendered docs are read by a model running in *someone else's* sandbox, and
+the import root there is the user's to choose: the same tool is
+`edittools.hedit` in one workspace and `capability1.hedit` in another. The
+author cannot know it, so Python code in a tool's docs refers to the tool as
+`$name`, and the harness substitutes the real import path when it renders the
+card in `list_tools()` / `get_tool()`:
+
+    in the source                 rendered, for a capability named 'edittools'
+    import $name                  import edittools.hedit
+    $name.read_file("a.py")       edittools.hedit.read_file("a.py")
+
+- `$name` goes in the `# examples:` directive and in any docstring block that
+  shows Python calling *this* tool.
+- The literal name stays wherever it is not code: the docstring's first line
+  (`hedit.py - ...`), CLI invocations (`./hedit.py read <file>`), usage lists,
+  and prose.
+- Never write `$name.py` -- it renders as `edittools.hedit.py`.
+- Never in executable code: a real import of a sibling tool stays a flat
+  basename (`import ansi`, `import fio`). `$name` means *this* tool only; there
+  is no placeholder for another tool, so an example that needs a sibling names
+  it as a filename in prose instead.
 
 ## Validating
 

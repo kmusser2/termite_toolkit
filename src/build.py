@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """build.py - compile & run C/C++ with sensible flags.
 # keywords: compile|build|c|cpp|c++|gcc|g++|make|run|binary|source|flags|syntax|check
-# examples: import build; build.build("g++", "c++17", "tetris.cpp", out="tetris")
+# examples: import $name; $name.build("g++", "c++17", "tetris.cpp", out="tetris")
 
 Usage:
   build.py cpp <source.cpp> [output]   compile C++ (default output: source w/o ext)

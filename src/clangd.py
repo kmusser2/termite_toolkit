@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 # keywords: |clangd|c++|cpp|lsp|language-server|diagnostics|errors|warnings|hover|definition|references|go-to-definition|find-references|compile_commands|compile-db|clang|semantic|navigation|index|code-intelligence|static-analysis|supervisor|session|cache|json|selftest|usages|find-usages|who-calls|callers|call-sites|call-hierarchy|used-by|rename|refactor|symbol|type-of|signature|impact|unused|dead-code|where-defined|
-# examples: |import clangd; clangd.diagnostics("/path/to/proj", "src/a.cpp")|import clangd; clangd.hover("/path/to/proj", "src/a.cpp", 42, 7)|./clangd.py --root DIR check src/a.cpp|
+# examples: |import $name; $name.diagnostics("/path/to/proj", "src/a.cpp")|import $name; $name.hover("/path/to/proj", "src/a.cpp", 42, 7)|./clangd.py --root DIR check src/a.cpp|
 """clangd.py - C++ semantics: find usages, definitions, types, diagnostics.
 
 clangd is the C++ language server.  It reads a project's compile_commands.json
@@ -17,15 +17,15 @@ relative to `root`).  clangd needs the project's compile database, so call
 compile_db_health(root) once first: the other verbs raise ClangdError when it
 is missing or stale.
 
-    import clangd
+    import $name
     root = "/path/to/project"
-    clangd.compile_db_health(root)          # is the build database usable?
-    clangd.check(root, "src/a.cpp")         # CheckSummary: counts + `clean`
-    clangd.diagnostics(root, "src/a.cpp")   # list[Diagnostic] (empty = clean)
-    clangd.hover(root, "src/a.cpp", 42, 7)  # symbol at line 42, column 7
-    clangd.definition(root, "src/a.cpp", 42, 7)
-    clangd.references(root, "src/a.cpp", 42, 7)
-    clangd.status(); clangd.close(root)
+    $name.compile_db_health(root)          # is the build database usable?
+    $name.check(root, "src/a.cpp")         # CheckSummary: counts + `clean`
+    $name.diagnostics(root, "src/a.cpp")   # list[Diagnostic] (empty = clean)
+    $name.hover(root, "src/a.cpp", 42, 7)  # symbol at line 42, column 7
+    $name.definition(root, "src/a.cpp", 42, 7)
+    $name.references(root, "src/a.cpp", 42, 7)
+    $name.status(); $name.close(root)
 
 Line and column are 1-based everywhere in this API (clangd/LSP is 0-based; the
 conversion is internal).  A query reflects the file's text on disk at call

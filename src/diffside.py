@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """diffside.py - side-by-side diff preview (SGR or HTML).
 # keywords: diff|preview|side-by-side|unified|patch|compare|git|table|html|sgr|color
-# examples: import diffside; diffside.from_unified(diff_text) | import diffside; diffside.files(old_lines, new_lines, old_name="a.py", new_name="b.py")
+# examples: import $name; $name.from_unified(diff_text) | import $name; $name.files(old_lines, new_lines, old_name="a.py", new_name="b.py")
 
 Renders a unified diff (hedit --preview, git diff, difflib) or two files
 side-by-side as a fixed-width boxed table:
@@ -33,10 +33,10 @@ Usage:
   diffside.py --selftest
 
 Python API:
-  import diffside
-  diffside.files(old_lines, new_lines, ...) -> [str]  # rendered rows
-  diffside.from_unified(diff_text, ...)     -> [str]  # rendered rows
-  diffside.html(diff_text, ...)             -> str    # full HTML page
+  import $name
+  $name.files(old_lines, new_lines, ...) -> [str]  # rendered rows
+  $name.from_unified(diff_text, ...)     -> [str]  # rendered rows
+  $name.html(diff_text, ...)             -> str    # full HTML page
 """
 import argparse
 import difflib

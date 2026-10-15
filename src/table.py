@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """table.py - ANSI-safe Unicode table renderer for terminal output."""
 # keywords: table|render|unicode|ansi|box|grid|column|display|terminal
-# examples: import table; table.render_table(["a", "b"], [["1", "2"]])|./table.py --selftest
+# examples: import $name; $name.render_table(["a", "b"], [["1", "2"]])|./table.py --selftest
 import shutil
 import sys
 import unicodedata

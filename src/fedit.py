@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """fedit.py - tiny line-based text editor for the sandbox.
 # keywords: edit|editor|line|insert|delete|replace|substitute|text|file
-# examples: import fedit; fedit.run_fedit("notes.txt", ["p", "a 3 added line", "w", "q"])
+# examples: import $name; $name.run_fedit("notes.txt", ["p", "a 3 added line", "w", "q"])
 
 Usage: fedit.py <file>
 

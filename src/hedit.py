@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """hedit.py - Hash-anchored line editor for AI agents.
 # keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply|read|grep|pattern|regex|match|search|window|context|discover|navigate
-# examples: import hedit; print(hedit.read_file("main.cpp")) | import hedit; print(hedit.read_file("main.cpp", pattern="^def ", context=2)) | import hedit; print(hedit.window(hedit.match("main.cpp", pattern="return"), before=1, after=1)) | import hedit; hedit.replace("main.cpp", "12#a1b2", ["return 0;"], preview=True) | import hedit; hedit.batch("main.cpp", [{"op": "replace", "anchor": "12#a1b2", "lines": ["x = 1"]}], preview=True)
+# examples: import $name; print($name.read_file("main.cpp")) | import $name; print($name.read_file("main.cpp", pattern="^def ", context=2)) | import $name; print($name.window($name.match("main.cpp", pattern="return"), before=1, after=1)) | import $name; $name.replace("main.cpp", "12#a1b2", ["return 0;"], preview=True) | import $name; $name.batch("main.cpp", [{"op": "replace", "anchor": "12#a1b2", "lines": ["x = 1"]}], preview=True)
 
 Implements the "hashline" editing idea (Can Boluk / hledit / Dirac):
 instead of tracking line numbers, each line is tagged with a short content
@@ -23,10 +23,10 @@ License: MIT.
 
 READING (start here) -- read_file() returns a ReadResult that *renders as the
 anchored lines*, so you can emit it directly; no formatting needed:
-    res = hedit.read_file("foo.py")                         # whole file
-    res = hedit.read_file("foo.py", offset=40, limit=20)    # a page
-    res = hedit.read_file("foo.py", pattern="int|double", context=2)  # regex + window
-    res = hedit.read_file("foo.py", grep="TODO", context=1)          # literal + window
+    res = $name.read_file("foo.py")                         # whole file
+    res = $name.read_file("foo.py", offset=40, limit=20)    # a page
+    res = $name.read_file("foo.py", pattern="int|double", context=2)  # regex + window
+    res = $name.read_file("foo.py", grep="TODO", context=1)          # literal + window
     print(res)      # one "LN#HASH|text" per line, e.g. 12#NKA|return 0;
   pattern= is a regex (re.search per line); grep= is a literal substring; give
   one, not both. context= keeps N lines around each match (spans merged).
@@ -40,8 +40,8 @@ anchored lines*, so you can emit it directly; no formatting needed:
   (query set, hits == ()) from a page (query None).
 
 DISCOVER, THEN EXPAND (one expression, no second round-trip):
-    m   = hedit.match("foo.py", pattern="^def ")   # -> Match(path, hits, query)
-    res = hedit.window(m, before=1, after=2)        # each hit +/- context, merged
+    m   = $name.match("foo.py", pattern="^def ")   # -> Match(path, hits, query)
+    res = $name.window(m, before=1, after=2)        # each hit +/- context, merged
   match() finds line numbers only; window() returns the surrounding lines.
 
 ANCHORS -- an anchor is "LN#HASH" (e.g. 12#NKA). Each Line prints as
@@ -49,12 +49,12 @@ ANCHORS -- an anchor is "LN#HASH" (e.g. 12#NKA). Each Line prints as
 (the hash) alone is NOT an anchor and will be rejected.
 
 EDITING (stale-safe; nothing is written when an anchor is bad or stale):
-    hedit.replace("foo.py", "12#NKA", ["new line"])           -> EditResult(ok=True, ...)
-    hedit.replace("foo.py", "12#NKA", ["new"], preview=True)  -> EditResult(ok=True, preview=True, diff="...") (no write)
-    hedit.insert("foo.py", "12#NKA", ["x"], before=True)      # default inserts after
-    hedit.delete("foo.py", "12#NKA")                          # or an [anchor, end_anchor] range
-    hedit.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
-    hedit.hash_line("def f():", 12)                           -> "NKA"
+    $name.replace("foo.py", "12#NKA", ["new line"])           -> EditResult(ok=True, ...)
+    $name.replace("foo.py", "12#NKA", ["new"], preview=True)  -> EditResult(ok=True, preview=True, diff="...") (no write)
+    $name.insert("foo.py", "12#NKA", ["x"], before=True)      # default inserts after
+    $name.delete("foo.py", "12#NKA")                          # or an [anchor, end_anchor] range
+    $name.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
+    $name.hash_line("def f():", 12)                           -> "NKA"
 
 ERRORS -- an edit returns EditResult(ok=False, error=TAG, message=...) and
 writes nothing. TAG is "stale" (anchor well-formed but the line changed) or

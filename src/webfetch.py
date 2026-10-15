@@ -2,17 +2,17 @@
 # TYPE: TOOLKIT
 """webfetch.py - fetch pages; urlgrep() pulls the lines you need.
 # keywords: url|grep|fetch|web|http|html|markdown|text|download|page|content|curl|scrape|retrieve|get|distill|extract|filter|lines|regex|pattern|snippet|lookup|find|specific|section|token|efficient|context
-# examples: import webfetch; webfetch.urlgrep("https://openrouter.ai/docs/limits", ["limit_remaining"], max_lines=5) | import webfetch; webfetch.head("https://example.com") | import webfetch; webfetch.fetch_markdown("https://example.com")
+# examples: import $name; $name.urlgrep("https://openrouter.ai/docs/limits", ["limit_remaining"], max_lines=5) | import $name; $name.head("https://example.com") | import $name; $name.fetch_markdown("https://example.com")
 
 Token-efficiency first: when you need something SPECIFIC from a page, call
 urlgrep() (fetch + filter in one call -- only matching lines enter context);
 call head() for a quick outline of the top of a page; call fetch_markdown() /
 fetch_text() / fetch_html() only when you want the whole page.
 
-  import webfetch
-  webfetch.urlgrep(url, patterns, max_lines=10, width=150, ctx_before=0,
-                   ctx_after=0, case=True, format=webfetch.Format.TEXT)
-  webfetch.head(url, n=20, width=150)
+  import $name
+  $name.urlgrep(url, patterns, max_lines=10, width=150, ctx_before=0,
+                ctx_after=0, case=True, format=$name.Format.TEXT)
+  $name.head(url, n=20, width=150)
 
 Fetches a URL and returns the content as Markdown (default), plain text, or
 raw HTML. Detects images and can save them. Stdlib-only (no pip deps).
@@ -39,11 +39,11 @@ Options:
       --selftest                   run built-in self tests and exit
 
 Python API:
-  import webfetch
-  result = webfetch.fetch_markdown("https://example.com")
+  import $name
+  result = $name.fetch_markdown("https://example.com")
   print(result["output"])
-  webfetch.urlgrep("https://example.com/docs", ["timeout"], max_lines=5)
-  webfetch.head("https://example.com")   # outline of the top (markdown)
+  $name.urlgrep("https://example.com/docs", ["timeout"], max_lines=5)
+  $name.head("https://example.com")   # outline of the top (markdown)
 
 The parsed-HTML tree is also public: parse_html() -> Node, find_all() and
 text_of() query it without reaching into node internals.

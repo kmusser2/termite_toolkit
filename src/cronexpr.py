@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 # keywords: |cron|crontab|schedule|scheduler|next-run|fire-time|job|
-# examples: |import cronexpr; cronexpr.next_runs('*/15 * * * *', count=3)|import cronexpr; cronexpr.explain('0 9 * * 1-5')|./cronexpr.py '@daily' --count 2|
+# examples: |import $name; $name.next_runs('*/15 * * * *', count=3)|import $name; $name.explain('0 9 * * 1-5')|./cronexpr.py '@daily' --count 2|
 """cronexpr.py - compute upcoming fire times for cron expressions.
 
 Parses standard 5-field crontab syntax (minute hour day-of-month month
@@ -13,9 +13,9 @@ day semantics: when BOTH day-of-month and day-of-week are restricted (not
 ValueError on malformed input.
 
 Python API (importable from any python_eval call):
-  import cronexpr
-  cronexpr.next_runs('*/15 * * * *', count=3)
-  cronexpr.explain('0 9 * * 1-5')['next_run']
+  import $name
+  $name.next_runs('*/15 * * * *', count=3)
+  $name.explain('0 9 * * 1-5')['next_run']
 
 CLI:
   ./cronexpr.py '*/15 * * * *' [--count 3] [--start ISO8601] [--tz ZONE]

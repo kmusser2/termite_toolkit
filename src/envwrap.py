@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 # keywords: |env|environment|sandbox|home|pip|git|wrapper|shell|sh|helpers|permissions|cache|payload|
-# examples: |import envwrap; envwrap.envrun(["git", "status"])||./envwrap.py pip list||./envwrap.py --selftest|
+# examples: |import $name; $name.envrun(["git", "status"])||./envwrap.py pip list||./envwrap.py --selftest|
 """envwrap.py - Python entry carrying the sandbox environment shell helpers.
 
 The shell helpers are package payload: they ship in this module's own
@@ -19,10 +19,10 @@ module's directory, so one invocation style works in the source tree and in
 an installed package.
 
 Python API:
-  import envwrap
-  envwrap.envrun(["git", "status"])  -> exit code of the command
-  envwrap.pip(["install", "numpy"])  -> exit code of pip
-  envwrap.permissions_check()        -> exit code of the probe
+  import $name
+  $name.envrun(["git", "status"])  -> exit code of the command
+  $name.pip(["install", "numpy"])  -> exit code of pip
+  $name.permissions_check()        -> exit code of the probe
 
 CLI:
   envwrap.py envrun <cmd> [args...]
