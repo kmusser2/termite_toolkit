@@ -29,9 +29,11 @@ import tempfile
 from collections.abc import Callable, Sequence
 from typing import TypedDict
 
-# --- sibling tools live in this directory (hedit supplies anchors) ----------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import hedit  # noqa: E402
+# --- sibling tool (hedit supplies anchors) ----------------------------------
+if __package__:
+    from . import hedit
+else:
+    import hedit
 
 
 __all__ = ["Backend", "ParseResult", "Symbol", "detect_lang", "parse",

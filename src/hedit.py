@@ -2,7 +2,7 @@
 # TYPE: TOOLKIT
 """hedit.py - Hash-anchored line editor for AI agents.
 # keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply|read|grep|pattern|regex|match|search|window|context|discover|navigate
-# examples: import $name; print($name.read_file("main.cpp")) | import $name; print($name.read_file("main.cpp", pattern="^def ", context=2)) | import $name; print($name.window($name.match("main.cpp", pattern="return"), before=1, after=1)) | import $name; $name.replace("main.cpp", "12#a1b2", ["return 0;"], preview=True) | import $name; $name.batch("main.cpp", [{"op": "replace", "anchor": "12#a1b2", "lines": ["x = 1"]}], preview=True)
+# examples: import $name; print($name.read_file("main.cpp")) | import $name; print($name.read_file("main.cpp", pattern="^def ", context=2)) | import $name; print($name.window($name.match("main.cpp", pattern="return"), before=1, after=1)) | import $name; $name.replace("main.cpp", "12#NKA", ["return 0;"], preview=True) | import $name; $name.batch("main.cpp", [{"op": "replace", "anchor": "12#NKA", "lines": ["x = 1"]}], preview=True)
 
 Implements the "hashline" editing idea (Can Boluk / hledit / Dirac):
 instead of tracking line numbers, each line is tagged with a short content
@@ -83,7 +83,10 @@ import sys
 from dataclasses import asdict, dataclass
 from typing import Iterable, NamedTuple, Sequence, TypedDict
 
-import fio
+if __package__:
+    from . import fio
+else:
+    import fio
 
 __all__ = ["Edit", "EditResult", "Line", "Match", "ReadResult",
            "fnv1a_32", "hash_line", "parse_anchor", "read_lines", "read_file",

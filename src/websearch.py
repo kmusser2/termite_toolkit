@@ -40,10 +40,12 @@ import urllib.parse
 from enum import StrEnum
 from typing import TypedDict
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
-
-import fio
-import webfetch
+if __package__:
+    from . import fio
+    from . import webfetch
+else:
+    import fio
+    import webfetch
 
 SEARCH_URL = "https://html.duckduckgo.com/html/?q=%s"
 BING_URL = "https://www.bing.com/search?q=%s&setlang=en&count=%d"

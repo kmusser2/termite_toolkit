@@ -26,8 +26,12 @@ import time
 from enum import StrEnum
 from typing import TypedDict
 
-import fio
-from table import render_table
+if __package__:
+    from . import fio
+    from .table import render_table
+else:
+    import fio
+    from table import render_table
 
 
 class Status(StrEnum):

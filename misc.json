@@ -23,7 +23,6 @@
         {
             "tool": "src/envwrap.py",
             "requires": [
-                "src/envwrap.py",
                 "src/envrun",
                 "src/pip",
                 "src/permissions-check.sh"

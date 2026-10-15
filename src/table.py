@@ -8,7 +8,10 @@ import sys
 import unicodedata
 from typing import Sequence
 
-import ansi
+if __package__:
+    from . import ansi
+else:
+    import ansi
 
 __all__ = ["display_width", "render_table", "selftest", "main"]
 

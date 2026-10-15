@@ -46,13 +46,19 @@ def run(cmd: Sequence[str], timeout: float = 30, input: str | None = None) -> tu
         return None, str(e)
 
 class Check:
-    def __init__(self, quiet):
+    """Collects probe results and prints each as it arrives; quiet hides passes."""
+
+    def __init__(self, quiet: bool) -> None:
         self.quiet = quiet; self.results = []
-    def add(self, name, ok, detail=""):
+
+    def add(self, name: str, ok: bool, detail: str = "") -> None:
+        """Record one result (name, ok, detail) and print it unless quiet and passing."""
         self.results.append((name, ok, detail))
         if not self.quiet or not ok:
             print(f"[{'OK ' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
-    def done(self):
+
+    def done(self) -> int:
+        """Print the summary line and return the exit code (0 all green, else 1)."""
         bad = [n for n, ok, _ in self.results if not ok]
         print(f"\nhealthcheck: {len(self.results)-len(bad)}/{len(self.results)} passed"
               + (f"  FAILED: {', '.join(bad)}" if bad else "  ALL GREEN"))

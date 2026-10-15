@@ -33,7 +33,7 @@ uncommitted (`main`, no commits) and evolving.
 |------|-----------|-------|
 | `src/` | The toolkit: reusable tool modules | Auto-registered (see *Tool registry*) |
 | `TOOLKIT/` | Seeded **example** tools | `calculator.py`, `current_time.py`, `get_weather.py`; git-ignored |
-| `docs/` | Long-form documentation | `docs/CAPABILITIES.md` (capability manifest schema & rules) |
+| `docs/` | Long-form documentation | `docs/TOOL_AUTHORING.md` (generic tool-authoring contract), `docs/TOOL_AUTHORING_NOTES.md` (how it applies here), `docs/CAPABILITIES.md` (capability manifest schema & rules) |
 | `tests/` | Test scaffolding (**empty**) | Prefer per-module `--selftest` (see *Validating*) |
 | `tmp/` | Scratch space | Ephemeral, throwaway; never commit it |
 | `pyproject.toml` | Project metadata | `name = "Termite-Toolkit"`, `version = "0.1.0"`, `requires-python = ">=3.11"` |
@@ -51,7 +51,7 @@ The filesystem **is** the registry: any `.py` file whose first 15 lines contain
 - Discover: `list_tools`
 - Full usage (signatures, TypedDicts, examples): `get_tool(<name>)`
 
-Capability manifests (`workspace.json`, `network.json`, `cpp.json`, `misc.json`
+Capability manifests (`edit.json`, `misc.json`, `network.json`, `cpp.json`
 at the repo root) partition the tools; their schema and rules are documented
 in `docs/CAPABILITIES.md`.
 
@@ -79,6 +79,12 @@ shapes with `TypedDict`; prefix disallowed helpers with `_`; provide a
 `--selftest` and a `main(argv)`. New tools live in `src/`; add cross-references
 to them in this file.
 
+The **full, normative authoring contract** is `docs/TOOL_AUTHORING.md` -- header
+shape, the registry rules (R1-R7) and how each one fails, the import forms for
+sibling tools, and the `$name` placeholder. Read it before writing or editing
+any tool; `docs/TOOL_AUTHORING_NOTES.md` records how it applies to *this* repo
+(`src/`, the capability manifests, the `--selftest` checks).
+
 ### `$name` -- how docs name this tool
 
 The rendered docs are read by a model running in *someone else's* sandbox, and
@@ -98,10 +104,12 @@ card in `list_tools()` / `get_tool()`:
   (`hedit.py - ...`), CLI invocations (`./hedit.py read <file>`), usage lists,
   and prose.
 - Never write `$name.py` -- it renders as `edittools.hedit.py`.
-- Never in executable code: a real import of a sibling tool stays a flat
-  basename (`import ansi`, `import fio`). `$name` means *this* tool only; there
-  is no placeholder for another tool, so an example that needs a sibling names
-  it as a filename in prose instead.
+- Never in executable code: a sibling tool is imported with the *conditional
+  sibling form* -- `from . import fio` when this file is imported as part of a
+  package, plain `import fio` when it is run as a script -- and never with
+  `sys.path` surgery. `$name` means *this* tool only; there is no placeholder
+  for another tool, so an example that needs a sibling names it as a filename
+  in prose instead. Details: `docs/TOOL_AUTHORING.md`, section 3.
 
 ## Validating
 
@@ -118,7 +126,7 @@ card in `list_tools()` / `get_tool()`:
 function/class/method with signatures, line ranges, and anchors.
 
 **Editing** — use `src/hedit.py`, the hash-anchored, stale-safe line editor:
-anchors look like `12#a1b2`, and an edit is rejected *before* writing if the
+anchors look like `12#NKA`, and an edit is rejected *before* writing if the
 file changed since you read it. `symmap` anchors feed directly into `hedit`.
 Prefer `hedit` over ad-hoc writes; use `src/fio.py` (read/list/head/tail/
 write/append) or `src/fedit.py` for quick line-based tweaks.

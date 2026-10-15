@@ -27,7 +27,10 @@ import sys
 import time
 import stat
 
-import ansi
+if __package__:
+    from . import ansi
+else:
+    import ansi
 
 # Workspace root (contains src/ and tmp/); relative paths resolve here.
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

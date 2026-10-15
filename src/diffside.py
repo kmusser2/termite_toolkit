@@ -46,7 +46,10 @@ import shutil
 import sys
 from typing import Sequence
 
-import ansi
+if __package__:
+    from . import ansi
+else:
+    import ansi
 
 __all__ = ["files", "from_unified", "html", "html_files", "selftest", "main"]
 

@@ -39,7 +39,10 @@ import sys
 import time
 import shlex
 
-import ansi
+if __package__:
+    from . import ansi
+else:
+    import ansi
 
 __all__ = ["encode_key", "parse_cmd", "selftest", "main"]
 
