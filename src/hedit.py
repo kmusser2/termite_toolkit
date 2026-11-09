@@ -81,6 +81,13 @@ UNDO -- the second call is a pointer, not a re-sample:
     if not r.ok: ...
     $name.undo(r.undo)                                 # put it back, no text
 
+  A write is ALL-OR-NOTHING. Every edit in a batch is validated before anything
+  is written, so a stale anchor or a slot conflict writes nothing; and if
+  something fails after the new bytes are in place (a receipt that cannot be
+  created, say), the pre-image is restored before the error is raised. A call
+  that returns an error, or raises, changed nothing -- so there is never a
+  landed edit that the caller believes failed.
+
 ERRORS -- an edit returns EditResult(ok=False, error=TAG, message=...) and
 writes nothing. TAG is "stale" (anchor well-formed but the line changed) or
 "validation" (bad batch edit shape); malformed args raise UsageError and
@@ -394,10 +401,15 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
 def _write_with_undo(path: str, lines: Sequence[str], ending: str) -> str:
     """Write lines atomically and leave an undo receipt; returns its path.
 
+    All-or-nothing: the pre-image is captured first, and if anything fails
+    after the new bytes are in place -- a receipt that cannot be created is
+    the realistic case -- the pre-image is restored before the error
+    propagates. So a call that raises changed nothing, and a caller never sees
+    a failure on top of a landed edit.
+
     The pre-image is stored byte-exact next to the receipt, and the receipt
     records the sha256 of what the write left, so undo() can refuse when the
-    target changed in the meantime. If the write fails, the pre-image is
-    removed and nothing is left behind.
+    target changed in the meantime.
     """
     with open(path, "rb") as f:
         before = f.read()
@@ -418,6 +430,18 @@ def _write_with_undo(path: str, lines: Sequence[str], ending: str) -> str:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(record, f)
     except BaseException:
+        # Automatic undo: the edit must not survive a failure that told the
+        # caller it did not happen. Best effort -- the original error wins.
+        try:
+            with open(path, "rb") as f:
+                landed = f.read() != before
+        except OSError:
+            landed = False
+        if landed:
+            try:
+                _atomic_write_bytes(path, before)
+            except OSError:
+                pass
         for leftover in (pre_image, receipt):
             if leftover:
                 try:
@@ -1417,6 +1441,71 @@ def _selftest():
           _lines_from_text("X\nY\n") == ["X", "Y"])
     check("_lines_from_text keeps a real blank tail",
           _lines_from_text("X\n\n") == ["X", ""])
+
+    # --- all-or-nothing: a failure never leaves a landed edit behind ---
+    def _receipts():
+        return len(os.listdir(_undo_dir()))
+
+    # (a) the write itself fails
+    _ow(p, "a\nb\nc\n")
+    keep = open(p, "rb").read()
+    n0 = _receipts()
+    real_atomic = fio.atomic_write
+    fio.atomic_write = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
+    try:
+        try:
+            replace(p, read_file(p).lines[1].anchor, ["B"])
+            check("failed write raises", False)
+        except OSError:
+            check("failed write raises", True)
+    finally:
+        fio.atomic_write = real_atomic
+    check("failed write left the file untouched", open(p, "rb").read() == keep)
+    check("failed write left no receipt", _receipts() == n0)
+
+    # (b) the receipt cannot be created AFTER the bytes are in place
+    _ow(p, "a\nb\nc\n")
+    keep = open(p, "rb").read()
+    n0 = _receipts()
+    real_mk = tempfile.mkstemp
+    seen = {"n": 0}
+
+    def _flaky_mkstemp(*a, **k):
+        seen["n"] += 1
+        if seen["n"] == 2:              # the receipt, i.e. after the write landed
+            raise OSError("boom")
+        return real_mk(*a, **k)
+
+    tempfile.mkstemp = _flaky_mkstemp
+    try:
+        try:
+            replace(p, read_file(p).lines[1].anchor, ["B"])
+            check("receipt failure raises", False)
+        except OSError:
+            check("receipt failure raises", True)
+    finally:
+        tempfile.mkstemp = real_mk
+    check("receipt failure restored the pre-image", open(p, "rb").read() == keep)
+    check("receipt failure left no receipt", _receipts() == n0)
+
+    # (c) a batch that fails at the last step keeps none of its edits
+    _ow(p, "a\nb\nc\nd\n")
+    res = read_file(p)
+    keep = open(p, "rb").read()
+    n0 = _receipts()
+    seen["n"] = 0
+    tempfile.mkstemp = _flaky_mkstemp
+    try:
+        try:
+            batch(p, [{"op": "replace", "anchor": res.lines[0].anchor, "lines": ["A"]},
+                      {"op": "replace", "anchor": res.lines[3].anchor, "lines": ["D"]}])
+            check("batch receipt failure raises", False)
+        except OSError:
+            check("batch receipt failure raises", True)
+    finally:
+        tempfile.mkstemp = real_mk
+    check("batch failure applied none of its edits", open(p, "rb").read() == keep)
+    check("batch failure left no receipt", _receipts() == n0)
 
     print("\n%s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
