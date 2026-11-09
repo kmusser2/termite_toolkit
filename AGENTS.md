@@ -128,8 +128,10 @@ function/class/method with signatures, line ranges, and anchors.
 **Editing** — use `src/hedit.py`, the hash-anchored, stale-safe line editor:
 anchors look like `12#NKA`, and an edit is rejected *before* writing if the
 file changed since you read it. `symmap` anchors feed directly into `hedit`.
-Prefer `hedit` over ad-hoc writes; use `src/fio.py` (read/list/head/tail/
-write/append) or `src/fedit.py` for quick line-based tweaks.
+An edit's result carries `.windows` (pass it to `verify()`) and `.undo` (pass it
+to `undo()`), so the new text is written once and never re-emitted to look at it
+or to revert it. Prefer `hedit` over ad-hoc writes; use `src/fio.py`
+(read/list/head/tail/write/append) or `src/fedit.py` for quick line-based tweaks.
 
 **Reviewing changes** — use `src/diffside.py` to render a unified diff (from
 `hedit --preview`, `git diff`, or `difflib`) or two files side-by-side as a

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # TYPE: TOOLKIT
 """hedit.py - Hash-anchored line editor for AI agents.
-# keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply|read|grep|pattern|regex|match|search|window|context|discover|navigate
-# examples: import $name; print($name.read_file("main.cpp")) | import $name; print($name.read_file("main.cpp", pattern="^def ", context=2)) | import $name; print($name.window($name.match("main.cpp", pattern="return"), before=1, after=1)) | import $name; $name.replace("main.cpp", "12#NKA", ["return 0;"], preview=True) | import $name; $name.batch("main.cpp", [{"op": "replace", "anchor": "12#NKA", "lines": ["x = 1"]}], preview=True)
+# keywords: edit|editor|hash|anchor|hashline|stale|atomic|patch|diff|line|safe|reconcile|file|source|code|modify|change|rewrite|apply|read|grep|pattern|regex|match|search|window|context|discover|navigate|undo|revert|rollback|verify|receipt|batch|order-free
+# examples: import $name; print($name.read_file("main.cpp")) | import $name; print($name.read_file("main.cpp", pattern="^def ", context=2)) | import $name; print($name.window($name.match("main.cpp", pattern="return"), before=1, after=1)) | import $name; print($name.replace("main.cpp", $name.read_file("main.cpp").lines[0].anchor, ["return 0;"]).to_json()) | import $name; print($name.verify($name.replace("main.cpp", $name.read_file("main.cpp").lines[0].anchor, ["return 0;"]))) | import $name; print($name.undo($name.replace("main.cpp", $name.read_file("main.cpp").lines[0].anchor, ["return 0;"]).undo)) | import $name; print($name.batch("main.cpp", [{"op": "replace", "anchor": $name.read_file("main.cpp").lines[0].anchor, "lines": ["x = 1"]}]).windows)
 
 Implements the "hashline" editing idea (Can Boluk / hledit / Dirac):
 instead of tracking line numbers, each line is tagged with a short content
@@ -56,6 +56,31 @@ EDITING (stale-safe; nothing is written when an anchor is bad or stale):
     $name.batch("foo.py", [{"op": "insert", "anchor": "3#NKA", "lines": ["x"], "before": True}])
     $name.hash_line("def f():", 12)                           -> "NKA"
 
+  A batch is a SET of position-keyed edits, not a sequence: every edit must
+  have its own slot, so overlapping ranges, two inserts at one position, and an
+  insert inside a range another edit consumes are rejected ("validation",
+  nothing written). The outcome never depends on the order the edits are listed
+  in. Two blocks at one point are one insert with several lines.
+
+VERIFY -- LOOK ONLY IF YOU WANT TO (the edited text is never re-emitted):
+  An EditResult carries .windows: the post-edit line ranges the call changed --
+  one per edit, a delete's being its empty seam (start, start-1).
+    r = $name.batch("foo.py", edits)      # the text is emitted HERE, once
+    print($name.verify(r))                # those lines, fresh anchors, +1 context
+    print($name.verify(r, context=0))     # exactly the touched lines
+  The anchors are freshly computed, so editing continues from verify() output
+  with no re-read. verify() raises UsageError on a preview (it wrote nothing).
+
+UNDO -- the second call is a pointer, not a re-sample:
+  Every write returns .undo, the path of a receipt. undo(receipt) restores the
+  previous bytes EXACTLY (CRLF endings and a missing final newline included)
+  and refuses with "stale" if the file changed since, so a late undo can never
+  clobber another writer. One receipt per call, so a batch undoes as one step;
+  receipts live in $TMPDIR/hedit-undo/ and undo() deletes them on success.
+    r = $name.replace("foo.py", "12#NKA", ["x = 1"])   # writes: text emitted once
+    if not r.ok: ...
+    $name.undo(r.undo)                                 # put it back, no text
+
 ERRORS -- an edit returns EditResult(ok=False, error=TAG, message=...) and
 writes nothing. TAG is "stale" (anchor well-formed but the line changed) or
 "validation" (bad batch edit shape); malformed args raise UsageError and
@@ -71,15 +96,20 @@ CLI:
   ./hedit.py delete <file> <anchor> [<end-anchor>] [--preview]
   ./hedit.py batch <file> [--preview]   # JSON edits on stdin: op anchor end_anchor
                    # lines new_text before; --preview prints diff, no write
+  ./hedit.py undo <receipt>             # revert the write that receipt records
   ./hedit.py --selftest
 """
 
 import argparse
 import difflib
+import hashlib
+import itertools
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from typing import Iterable, NamedTuple, Sequence, TypedDict
 
@@ -91,7 +121,7 @@ else:
 __all__ = ["Edit", "EditResult", "Line", "Match", "ReadResult",
            "fnv1a_32", "hash_line", "parse_anchor", "read_lines", "read_file",
            "match", "window", "replace", "insert", "delete", "batch",
-           "write_lines_atomic", "main"]
+           "verify", "undo", "write_lines_atomic", "main"]
 
 HASH_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 chars, drops 0/O/1/I
 HASH_LEN = 3
@@ -196,11 +226,15 @@ class ReadResult:
 
 @dataclass(frozen=True)
 class EditResult:
-    """One edit's outcome (replace/insert/delete/batch).
+    """One edit's outcome (replace/insert/delete/batch, and undo()).
 
-    On success: first_changed_line/last_changed_line (1-based; batch also sets
-    edits_applied), and -- when preview=True -- diff, with nothing written. On
+    On success: windows -- the post-edit 1-based line ranges this call changed,
+    one per edit, merged where they touch (a delete's window is empty,
+    (start, start - 1), i.e. its seam), first_changed_line/last_changed_line
+    (the extent of those windows; batch also sets edits_applied); and, unless
+    preview=True, undo -- the path of a receipt that undo() reverses. On
     failure: error ("stale" | "validation") and message, with nothing written.
+    path names the file the result refers to; verify() reads it.
     to_json() gives the CLI's documented JSON shape.
     """
     ok: bool
@@ -211,6 +245,9 @@ class EditResult:
     first_changed_line: int | None = None
     last_changed_line: int | None = None
     edits_applied: int | None = None
+    windows: tuple[tuple[int, int], ...] = ()
+    undo: str | None = None
+    path: str | None = None
 
     def to_json(self) -> dict[str, object]:
         """The wire shape (JSON boundary conversion): only the keys carried."""
@@ -222,6 +259,12 @@ class EditResult:
                 out[key] = value
         if self.preview:
             out["preview"] = True
+        if self.windows:
+            out["windows"] = [list(w) for w in self.windows]
+        if self.undo is not None:
+            out["undo"] = self.undo
+        if self.path is not None:
+            out["path"] = self.path
         return out
 
 
@@ -310,6 +353,140 @@ def write_lines_atomic(path: str, lines: Sequence[str], ending: str = "\n") -> N
     if lines:
         text += ending
     fio.atomic_write(path, text)
+
+
+# --------------------------------------------------------------------------
+# Undo receipts (one per write call)
+# --------------------------------------------------------------------------
+
+_UNDO_DIR = "hedit-undo"
+
+
+def _undo_dir() -> str:
+    """The directory receipts live in (created on demand, inside the temp dir)."""
+    d = os.path.join(tempfile.gettempdir(), _UNDO_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _sha256(data: bytes) -> str:
+    """Hex SHA-256 of data -- the fingerprint undo() compares before restoring."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Replace path with data atomically, preserving the file mode.
+
+    Byte-level on purpose: fio.atomic_write is text-only, and undo must restore
+    a file exactly -- a missing final newline or non-UTF-8 bytes would not
+    survive a decode/encode round trip.
+    """
+    tmp = path + ".hedit-undo"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def _write_with_undo(path: str, lines: Sequence[str], ending: str) -> str:
+    """Write lines atomically and leave an undo receipt; returns its path.
+
+    The pre-image is stored byte-exact next to the receipt, and the receipt
+    records the sha256 of what the write left, so undo() can refuse when the
+    target changed in the meantime. If the write fails, the pre-image is
+    removed and nothing is left behind.
+    """
+    with open(path, "rb") as f:
+        before = f.read()
+    stem = "%s-%s-" % (os.path.basename(path) or "file",
+                       _sha256(os.path.abspath(path).encode("utf-8"))[:8])
+    d = _undo_dir()
+    fd, pre_image = tempfile.mkstemp(dir=d, prefix=stem, suffix=".before")
+    with os.fdopen(fd, "wb") as f:
+        f.write(before)
+    receipt = ""
+    try:
+        write_lines_atomic(path, lines, ending)
+        with open(path, "rb") as f:
+            after = f.read()
+        record = {"path": os.path.abspath(path), "before": pre_image,
+                  "sha256_before": _sha256(before), "sha256_after": _sha256(after)}
+        fd, receipt = tempfile.mkstemp(dir=d, prefix=stem, suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+    except BaseException:
+        for leftover in (pre_image, receipt):
+            if leftover:
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+        raise
+    return receipt
+
+
+def _discard(receipt: str) -> None:
+    """Delete a receipt and the pre-image it points at (best effort)."""
+    try:
+        with open(receipt, "r", encoding="utf-8") as f:
+            pre_image = json.load(f).get("before")
+    except (OSError, ValueError):
+        pre_image = None
+    for p in (pre_image, receipt):
+        if p:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def undo(receipt: str) -> EditResult:
+    """Revert the write that produced receipt; returns an EditResult.
+
+    Restores the previous bytes exactly -- CRLF endings, a missing final
+    newline, and non-UTF-8 content included -- and only if the target is still
+    byte-identical to what that write left, so a late undo can never clobber a
+    later change (error="stale"). An unknown or preview-only receipt is
+    error="validation". One receipt per write call, so a batch undoes as one
+    step. Nothing here re-emits or re-parses the edited text: the pre-image is
+    a file, and the edit's own text was emitted once, when it was made.
+    """
+    if not receipt:
+        return EditResult(ok=False, error="validation",
+                          message="no receipt: previews and rejected edits write nothing")
+    try:
+        with open(receipt, "r", encoding="utf-8") as f:
+            record = json.load(f)
+        path = record["path"]
+        pre_image = record["before"]
+        expected = record["sha256_after"]
+    except FileNotFoundError:
+        return EditResult(ok=False, error="validation",
+                          message="unknown receipt %r" % (receipt,))
+    except (OSError, ValueError, KeyError) as e:
+        return EditResult(ok=False, error="validation",
+                          message="unreadable receipt %r: %s" % (receipt, e))
+    try:
+        with open(path, "rb") as f:
+            current = f.read()
+    except OSError as e:
+        return EditResult(ok=False, path=path, error="stale",
+                          message="%s: %s" % (path, e))
+    if _sha256(current) != expected:
+        return EditResult(ok=False, path=path, error="stale",
+                          message="%s changed since that edit; refusing to undo" % path)
+    try:
+        with open(pre_image, "rb") as f:
+            before = f.read()
+    except OSError as e:
+        return EditResult(ok=False, path=path, error="validation",
+                          message="pre-image for %r is gone: %s" % (receipt, e))
+    _atomic_write_bytes(path, before)
+    _discard(receipt)
+    return EditResult(ok=True, path=path)
 
 
 # --------------------------------------------------------------------------
@@ -412,20 +589,24 @@ def window(m: Match, before: int = 0, after: int = 0,
                    truncated=False, next_offset=None, plain=plain, query=m.query)
 
 
-def _merge_windows(hits: Sequence[int], before: int, after: int,
-                   total: int) -> list[tuple[int, int]]:
-    """Merge each 1-based hit +/- context into disjoint [start, end] windows,
-    combining spans that overlap or touch."""
-    spans: list[tuple[int, int]] = []
-    for h in hits:
-        s, e = max(1, h - before), min(total, h + after)
+def _merge_spans(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge spans that overlap or touch into disjoint [start, end] ranges,
+    dropping empty or inverted ones (a delete's window is one)."""
+    out: list[tuple[int, int]] = []
+    for s, e in spans:
         if s > e:
             continue
-        if spans and s <= spans[-1][1] + 1:
-            spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+        if out and s <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
         else:
-            spans.append((s, e))
-    return spans
+            out.append((s, e))
+    return out
+
+
+def _merge_windows(hits: Sequence[int], before: int, after: int,
+                   total: int) -> list[tuple[int, int]]:
+    """Merge each 1-based hit +/- context into disjoint [start, end] windows."""
+    return _merge_spans((max(1, h - before), min(total, h + after)) for h in hits)
 
 
 def _records(lines: Sequence[str], indices: Iterable[int]) -> list[Line]:
@@ -446,8 +627,35 @@ def _result(records: Sequence[Line], hits: Iterable[int],
 
 
 # --------------------------------------------------------------------------
-# Edit primitives (stale-safe)
+# Edit primitives (stale-safe, order-free)
+#
+# Every edit path -- replace/insert/delete and batch -- goes through one
+# implementation: each request is validated against the file as it was read,
+# the validated edits are checked for slot conflicts, and the new file is built
+# by a single ascending splice. So the outcome depends on the set of anchors
+# alone: the order the edits are listed in cannot change a byte, and a pair of
+# edits that would need an order chosen is rejected instead of guessed.
 # --------------------------------------------------------------------------
+
+class _Spec(NamedTuple):
+    """One edit request (op, anchor, end_anchor, lines, before) -- the
+    pre-validation form that _plan() turns into a _Planned."""
+    op: str
+    anchor: str
+    end_anchor: str | None
+    lines: tuple[str, ...]
+    before: bool
+
+
+class _Planned(NamedTuple):
+    """One validated edit in pre-edit coordinates: consume old lines
+    [start, stop) and emit lines. An insert consumes nothing (start == stop)."""
+    op: str
+    start: int
+    stop: int
+    lines: tuple[str, ...]
+    anchor: str
+
 
 def _validate_anchor(lines, anchor):
     """Return (index) if anchor's line+hash matches current content, else None."""
@@ -463,60 +671,152 @@ def _validate_anchor(lines, anchor):
     return ln - 1
 
 
-def replace(path: str, anchor: str, new_lines: str | Sequence[str], end_anchor: str | None = None, preview: bool = False) -> EditResult:
-    """Replace the line(s) at anchor (through end_anchor, inclusive)."""
-    lines, ending = read_lines(path)
-    idx = _validate_anchor(lines, anchor)
+def _as_lines(new_lines: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize an edit's content: a bare str is ONE line, never split.
+
+    (Splitting a str here once corrupted files character by character, so the
+    API str means exactly what it says: one line. Use a sequence for several.)
+    """
+    if isinstance(new_lines, str):
+        new_lines = [new_lines]
+    return tuple(nl.rstrip("\r\n") for nl in new_lines)
+
+
+def _lines_from_text(text: str) -> list[str]:
+    """Split file or stdin content into lines: a trailing newline terminates
+    the last line instead of adding an empty one -- the inverse of the join in
+    write_lines_atomic, which appends exactly one ending."""
+    return text.splitlines()
+
+
+def _plan(lines: Sequence[str], spec: _Spec) -> _Planned | EditResult:
+    """Validate one edit against the current lines.
+
+    Returns its _Planned, or a stale EditResult when an anchor no longer
+    matches ('stale': the line changed since it was read). Raises UsageError
+    for a malformed anchor or a reversed range.
+    """
+    idx = _validate_anchor(lines, spec.anchor)
     if idx is None:
-        return _stale(anchor)
+        return _stale(spec.anchor)
     end_idx = idx
-    if end_anchor is not None:
-        e = _validate_anchor(lines, end_anchor)
+    if spec.end_anchor:
+        e = _validate_anchor(lines, spec.end_anchor)
         if e is None:
-            return _stale(end_anchor)
+            return _stale(spec.end_anchor)
         if e < idx:
             raise UsageError("end_anchor precedes start anchor")
         end_idx = e
-    if isinstance(new_lines, str):
-        new_lines = [new_lines]
-    new_lines = [nl.rstrip("\r\n") for nl in new_lines]
-    old = list(lines)
-    lines[idx:end_idx + 1] = new_lines
-    if preview:
-        return EditResult(ok=True, preview=True,
-                          diff=_unified_diff(path, old, lines),
-                          first_changed_line=idx + 1,
-                          last_changed_line=idx + len(new_lines))
-    write_lines_atomic(path, lines, ending)
-    return EditResult(ok=True, first_changed_line=idx + 1,
-                      last_changed_line=idx + len(new_lines))
+    if spec.op == "insert":
+        start = idx if spec.before else idx + 1
+        return _Planned("insert", start, start, spec.lines, spec.anchor)
+    return _Planned(spec.op, idx, end_idx + 1, spec.lines, spec.anchor)
 
 
-def insert(path: str, anchor: str, new_lines: str | Sequence[str], before: bool = False, preview: bool = False) -> EditResult:
-    """Insert new_lines before or after the anchor line; preview returns a diff without writing."""
+def _position_key(plan: _Planned) -> tuple[int, int]:
+    """Splice order: by start, with an insert ahead of a range that begins at
+    the same line (so 'insert before N' lands before N's replacement)."""
+    return (plan.start, plan.stop)
+
+
+def _conflict(plans: Sequence[_Planned]) -> str | None:
+    """Why these edits cannot all be applied, or None.
+
+    Every edit is position-keyed, so a pair that would need an ordering
+    decision is refused rather than resolved: two inserts at one position,
+    an insert inside a range another edit consumes, or overlapping ranges.
+    """
+    for a, b in itertools.combinations(sorted(plans, key=_position_key), 2):
+        if a.start == a.stop and b.start == b.stop:
+            if a.start == b.start:
+                return ("edits at %s and %s insert at the same position; "
+                        "combine them into one edit's lines" % (a.anchor, b.anchor))
+        elif a.start == a.stop or b.start == b.stop:
+            point, span = (a, b) if a.start == a.stop else (b, a)
+            if span.start < point.start < span.stop:
+                return ("the insert at %s falls inside the range replaced or "
+                        "deleted by %s; split them into separate calls"
+                        % (point.anchor, span.anchor))
+        elif max(a.start, b.start) < min(a.stop, b.stop):
+            return ("edits at %s and %s cover overlapping lines; "
+                    "split them into separate calls" % (a.anchor, b.anchor))
+    return None
+
+
+def _splice(lines: Sequence[str], plans: Sequence[_Planned]
+            ) -> tuple[list[str], list[tuple[int, int]]]:
+    """Build the edited file by splicing the plans into lines in one ascending
+    pass. Returns (new_lines, windows), each window being the post-edit 1-based
+    range that edit produced -- empty, (start, start - 1), for a delete."""
+    out: list[str] = []
+    windows: list[tuple[int, int]] = []
+    pos, cur = 1, 0     # next output line number (1-based); input cursor (0-based)
+    for plan in sorted(plans, key=_position_key):
+        if plan.start > cur:
+            out.extend(lines[cur:plan.start])
+            pos += plan.start - cur
+        windows.append((pos, pos + len(plan.lines) - 1))
+        out.extend(plan.lines)
+        pos += len(plan.lines)
+        cur = plan.stop
+    out.extend(lines[cur:])
+    return out, windows
+
+
+def _apply(path: str, specs: Sequence[_Spec], preview: bool = False) -> EditResult:
+    """Validate and apply edit specs atomically; nothing is written on error.
+
+    A stale anchor or a slot conflict returns EditResult(ok=False) with the
+    file untouched. On success the result carries every changed window in
+    post-edit coordinates and, unless preview=True, an undo receipt.
+    """
     lines, ending = read_lines(path)
-    idx = _validate_anchor(lines, anchor)
-    if idx is None:
-        return _stale(anchor)
-    if isinstance(new_lines, str):
-        new_lines = [new_lines]
-    new_lines = [nl.rstrip("\r\n") for nl in new_lines]
-    at = idx if before else idx + 1
-    old = list(lines)
-    lines[at:at] = new_lines
+    plans: list[_Planned] = []
+    for spec in specs:
+        plan = _plan(lines, spec)
+        if isinstance(plan, EditResult):
+            return plan
+        plans.append(plan)
+    if not plans:
+        return EditResult(ok=True, path=path, edits_applied=0)
+    problem = _conflict(plans)
+    if problem is not None:
+        return EditResult(ok=False, path=path, error="validation", message=problem)
+    new_lines, windows = _splice(lines, plans)
+    first = min(w[0] for w in windows)
+    last = max(max(w) for w in windows)
+    extent = {"path": path, "first_changed_line": first,
+              "last_changed_line": last, "edits_applied": len(plans),
+              "windows": tuple(windows)}
     if preview:
         return EditResult(ok=True, preview=True,
-                          diff=_unified_diff(path, old, lines),
-                          first_changed_line=at + 1,
-                          last_changed_line=at + len(new_lines))
-    write_lines_atomic(path, lines, ending)
-    return EditResult(ok=True, first_changed_line=at + 1,
-                      last_changed_line=at + len(new_lines))
+                          diff=_unified_diff(path, lines, new_lines), **extent)
+    receipt = _write_with_undo(path, new_lines, ending)
+    return EditResult(ok=True, undo=receipt, **extent)
 
 
-def delete(path: str, anchor: str, end_anchor: str | None = None, preview: bool = False) -> EditResult:
+def replace(path: str, anchor: str, new_lines: str | Sequence[str],
+            end_anchor: str | None = None, preview: bool = False) -> EditResult:
+    """Replace the line(s) at anchor (through end_anchor, inclusive).
+
+    new_lines is a sequence of lines, or a str meaning exactly ONE line.
+    preview=True returns the diff and writes nothing.
+    """
+    return _apply(path, [_Spec("replace", anchor, end_anchor,
+                               _as_lines(new_lines), False)], preview)
+
+
+def insert(path: str, anchor: str, new_lines: str | Sequence[str],
+           before: bool = False, preview: bool = False) -> EditResult:
+    """Insert new_lines before or after the anchor line (default: after)."""
+    return _apply(path, [_Spec("insert", anchor, None,
+                               _as_lines(new_lines), before)], preview)
+
+
+def delete(path: str, anchor: str, end_anchor: str | None = None,
+           preview: bool = False) -> EditResult:
     """Delete the line(s) at anchor (through end_anchor, inclusive)."""
-    return replace(path, anchor, [], end_anchor=end_anchor, preview=preview)
+    return _apply(path, [_Spec("delete", anchor, end_anchor, (), False)], preview)
 
 
 def _stale(anchor: str) -> EditResult:
@@ -525,81 +825,77 @@ def _stale(anchor: str) -> EditResult:
 
 
 def batch(path: str, edits: Sequence[Edit], preview: bool = False) -> EditResult:
-    """Apply multiple edits atomically. All anchors and edit keys are
-    validated first; an unknown key is a validation error, not ignored."""
-    lines, ending = read_lines(path)
-    prepared = []
+    """Apply multiple edits atomically and order-free.
+
+    Every key and op is validated first, and every edit must have its own slot:
+    overlapping ranges, two inserts at one position, and an insert inside a
+    range another edit consumes are validation errors (nothing is written).
+    The result therefore depends on the set of anchors alone -- reversing the
+    list cannot change a byte. Two blocks at one point are one edit with
+    several lines, not two inserts.
+    """
+    specs: list[_Spec] = []
     for e in edits:
         unknown = set(e) - _EDIT_KEYS
         if unknown:
-            return EditResult(ok=False, error="validation",
+            return EditResult(ok=False, path=path, error="validation",
                               message="unknown key(s) %s (want %s)"
                                       % (", ".join(sorted(repr(k) for k in unknown)),
                                          "|".join(sorted(_EDIT_KEYS))))
         op = e.get("op")
         if op not in ("replace", "insert", "delete"):
-            return EditResult(ok=False, error="validation",
+            return EditResult(ok=False, path=path, error="validation",
                               message="unknown op %r (want replace|insert|delete)" % (op,))
         before = e.get("before", False)
         if before and op != "insert":
-            return EditResult(ok=False, error="validation",
+            return EditResult(ok=False, path=path, error="validation",
                               message="'before' is only valid for insert edits")
         anchor = e.get("anchor")
         if not anchor:
-            return EditResult(ok=False, error="validation",
+            return EditResult(ok=False, path=path, error="validation",
                               message="edit missing 'anchor'")
-        idx = _validate_anchor(lines, anchor)
-        if idx is None:
-            return _stale(anchor)
-        end_idx = idx
-        if e.get("end_anchor"):
-            end_idx = _validate_anchor(lines, e["end_anchor"])
-            if end_idx is None:
-                return _stale(e["end_anchor"])
-            if end_idx < idx:
-                raise UsageError("end_anchor precedes start anchor")
         if op in ("replace", "insert"):
             raw = e.get("lines", e.get("new_text"))
             if raw is None:
-                return EditResult(ok=False, error="validation",
-                              message="%s edit missing 'lines' (or 'new_text')" % op)
+                return EditResult(ok=False, path=path, error="validation",
+                                  message="%s edit missing 'lines' (or 'new_text')" % op)
             if isinstance(raw, str):
-                raw = raw.split("\n")
-            new_lines = [nl.rstrip("\r\n") for nl in raw]
+                raw = _lines_from_text(raw)
+            new_lines = tuple(nl.rstrip("\r\n") for nl in raw)
         else:
-            new_lines = []
-        prepared.append((op, idx, end_idx, new_lines, before))
+            new_lines = ()
+        specs.append(_Spec(op, anchor, e.get("end_anchor"), new_lines, before))
+    return _apply(path, specs, preview)
 
-    # Apply in reverse order so earlier indices stay valid.
-    old = list(lines)
-    changed = []
-    for op, idx, end_idx, new_lines, before in sorted(prepared, key=lambda x: x[1], reverse=True):
-        if op == "replace":
-            lines[idx:end_idx + 1] = new_lines
-            changed.append((idx + 1, idx + len(new_lines)))
-        elif op == "insert":
-            at = idx if before else idx + 1  # 'before' inserts ahead of the anchor
-            lines[at:at] = new_lines
-            changed.append((at + 1, at + len(new_lines)))
-        elif op == "delete":
-            lines[idx:end_idx + 1] = []
-            changed.append((idx + 1, idx + 1))
-        else:
-            raise ValueError("unknown op %r" % op)
 
-    if changed:
-        first = min(c[0] for c in changed)
-        last = max(c[1] for c in changed)
-    else:
-        first = last = 0
-    if preview:
-        return EditResult(ok=True, preview=True,
-                          diff=_unified_diff(path, old, lines),
-                          first_changed_line=first, last_changed_line=last,
-                          edits_applied=len(prepared))
-    write_lines_atomic(path, lines, ending)
-    return EditResult(ok=True, first_changed_line=first, last_changed_line=last,
-                      edits_applied=len(prepared))
+def verify(result: EditResult, context: int = 1) -> ReadResult:
+    """Re-read the lines a committed edit changed -- every region, in one call.
+
+    The result already carries the regions (EditResult.windows), so this is the
+    on-demand half: looking costs nothing until you ask. Returns the same
+    ReadResult as read_file() -- the touched lines with FRESH anchors, so
+    editing can continue at once -- with each region widened by context lines
+    (a delete's empty window becomes its seam) and touching ones merged.
+
+    Raises UsageError for a preview (it wrote nothing); a failed edit returns
+    an empty ReadResult. undo() results report no windows, so verify() on one
+    is empty: there is nothing to look at until you read the file.
+    """
+    if context < 0:
+        raise UsageError("context must be >= 0")
+    if result.preview:
+        raise UsageError("verify reads a committed edit; a preview wrote nothing")
+    if not result.ok or result.path is None or not result.windows:
+        return ReadResult(ok=False, lines=(), hits=(), windows=(), payload=(),
+                          truncated=False, next_offset=None, total_lines=0,
+                          query=None)
+    lines, _ = read_lines(result.path)
+    total = len(lines)
+    wins = _merge_spans((max(1, s - context), min(total, max(s, e) + context))
+                        for s, e in result.windows)
+    records = _records(lines, [i for (s, e) in wins for i in range(s - 1, e)])
+    return _result(records, hits=[], windows=wins, total=total, truncated=False,
+                   next_offset=None, plain=False, query=None)
 
 
 # --------------------------------------------------------------------------
@@ -641,13 +937,13 @@ def _read_args(parser, args):
 def _content_from(args):
     new_text = getattr(args, "new_text", None)
     if new_text is not None:
-        return new_text.split("\n")
+        return _lines_from_text(new_text)
     file_input = getattr(args, "file_input", None)
     if file_input:
         with open(file_input, "r", encoding="utf-8") as f:
-            return f.read().split("\n")
+            return _lines_from_text(f.read())
     # stdin
-    return sys.stdin.read().split("\n")
+    return _lines_from_text(sys.stdin.read())
 
 
 def _write_cmd(parser, args, op):
@@ -723,7 +1019,6 @@ def _selftest():
     check("parse bad anchor", parse_anchor("abc") is None)
 
     # Stale-safe replace on a temp file
-    import tempfile
     d = tempfile.mkdtemp()
     p = os.path.join(d, "t.txt")
 
@@ -980,6 +1275,149 @@ def _selftest():
     with open(p) as f:
         check("Line.anchor replace content", f.read().split("\n")[1] == "# replaced")
 
+    # --- batch: slot uniqueness (list order is never a decision to make) ---
+    _ow(p, "a\nb\nc\nd\ne\n")
+    res = read_file(p)
+    A, B, C, D, E = (res.lines[i].anchor for i in range(5))
+    rejected = {
+        "overlapping ranges": [
+            {"op": "replace", "anchor": B, "end_anchor": D, "lines": ["X"]},
+            {"op": "replace", "anchor": C, "lines": ["Y"]}],
+        "two inserts at one anchor": [
+            {"op": "insert", "anchor": A, "lines": ["one"]},
+            {"op": "insert", "anchor": A, "lines": ["two"]}],
+        "insert sharing a slot with insert-before": [
+            {"op": "insert", "anchor": A, "lines": ["after-a"]},
+            {"op": "insert", "anchor": B, "lines": ["before-b"], "before": True}],
+        "insert inside a deleted range": [
+            {"op": "delete", "anchor": B, "end_anchor": D},
+            {"op": "insert", "anchor": C, "lines": ["in-the-hole"]}],
+    }
+    for label, edits in rejected.items():
+        r = batch(p, edits)
+        check("batch rejects %s" % label, r.ok is False and r.error == "validation")
+        check("rejected batch wrote nothing (%s)" % label,
+              open(p).read() == "a\nb\nc\nd\ne\n")
+
+    # adjacency that is NOT ambiguous still applies, deterministically
+    r = batch(p, [{"op": "insert", "anchor": A, "lines": ["after-a"]},
+                  {"op": "replace", "anchor": B, "lines": ["B!"]}])
+    check("batch allows insert after N beside replace N+1",
+          r.ok is True and open(p).read() == "a\nafter-a\nB!\nc\nd\ne\n")
+
+    # order-freedom: disjoint edits -> same bytes whatever the list order
+    _ow(p, "a\nb\nc\nd\ne\n")
+    res = read_file(p)
+    A, C, D, E = (res.lines[i].anchor for i in (0, 2, 3, 4))
+    edits = [{"op": "replace", "anchor": A, "lines": ["A1", "A2"]},
+             {"op": "delete", "anchor": D},
+             {"op": "insert", "anchor": E, "lines": ["E+"]}]
+    r = batch(p, edits)
+    fwd = open(p).read()
+    check("batch disjoint ok", r.ok is True and r.edits_applied == 3)
+    check("batch disjoint content", fwd == "A1\nA2\nb\nc\ne\nE+\n")
+    check("batch windows are post-edit", r.windows == ((1, 2), (5, 4), (6, 6)))
+    _ow(p, "a\nb\nc\nd\ne\n")
+    batch(p, list(reversed(edits)))
+    check("batch order-free: reversed list = same bytes", open(p).read() == fwd)
+
+    # --- windows: an earlier edit must not corrupt a later one's coordinates ---
+    _ow(p, "a\nb\nc\nd\n")
+    res = read_file(p)
+    r = batch(p, [{"op": "replace", "anchor": res.lines[0].anchor,
+                   "lines": ["A1", "A2", "A3"]},
+                  {"op": "replace", "anchor": res.lines[3].anchor, "lines": ["D"]}])
+    check("windows survive a shift (regression)", r.windows == ((1, 3), (6, 6)))
+    check("first/last are the window extent",
+          (r.first_changed_line, r.last_changed_line) == (1, 6))
+    check("verify shows the shifted edit where it really is",
+          [line.text for line in verify(r, context=0).lines] == ["A1", "A2", "A3", "D"])
+
+    # --- verify: on demand, per region, fresh anchors ---
+    _ow(p, "".join("l%d\n" % i for i in range(1, 13)))
+    res = read_file(p)
+    r = batch(p, [{"op": "replace", "anchor": res.lines[1].anchor, "lines": ["L2"]},
+                  {"op": "replace", "anchor": res.lines[9].anchor, "lines": ["L10"]}])
+    v0 = verify(r)
+    check("verify context=1 widens each region", v0.windows == ((1, 3), (9, 11)))
+    v1 = verify(r, context=0)
+    check("verify context=0 = touched lines only",
+          [line.ln for line in v1.lines] == [2, 10])
+    check("verify re-anchors for the next edit",
+          replace(p, v1.lines[0].anchor, ["L2b"]).ok is True)
+
+    _ow(p, "a\nb\nc\n")
+    res = read_file(p)
+    r = delete(p, res.lines[1].anchor)
+    check("delete window is the empty seam", r.windows == ((2, 1),))
+    check("verify shows the seam around a delete",
+          [line.text for line in verify(r).lines] == ["a", "c"])
+
+    try:
+        verify(replace(p, read_file(p).lines[0].anchor, ["A"], preview=True))
+        check("verify rejects a preview", False)
+    except UsageError:
+        check("verify rejects a preview", True)
+
+    # --- undo receipts ---
+    _ow(p, "a\nb\nc\n")
+    res = read_file(p)
+    before_bytes = open(p, "rb").read()
+    r = replace(p, res.lines[1].anchor, ["B", "B2"])
+    check("a write returns a receipt", isinstance(r.undo, str) and os.path.exists(r.undo))
+    check("previews carry no receipt",
+          replace(p, read_file(p).lines[0].anchor, ["A"], preview=True).undo is None)
+    u = undo(r.undo)
+    check("undo ok", u.ok is True)
+    check("undo restores exact bytes", open(p, "rb").read() == before_bytes)
+    check("undo removed its receipt", not os.path.exists(r.undo))
+
+    # CRLF + missing final newline survive a round trip
+    with open(p, "wb") as f:
+        f.write(b"a\r\nb\r\nc")
+    res = read_file(p)
+    r = replace(p, res.lines[1].anchor, ["B"])
+    check("edit on a CRLF/no-final-newline file landed",
+          open(p, "rb").read() != b"a\r\nb\r\nc")
+    undo(r.undo)
+    check("undo restores CRLF + missing final newline",
+          open(p, "rb").read() == b"a\r\nb\r\nc")
+
+    # a stale undo refuses instead of clobbering a later change
+    _ow(p, "a\nb\nc\n")
+    res = read_file(p)
+    r = replace(p, res.lines[0].anchor, ["A"])
+    _ow(p, "A\nb\nc\n# someone else\n")
+    u = undo(r.undo)
+    check("stale undo refused", u.ok is False and u.error == "stale")
+    check("stale undo wrote nothing",
+          open(p).read() == "A\nb\nc\n# someone else\n")
+
+    # one receipt per call: a batch undoes as one step
+    _ow(p, "a\nb\nc\n")
+    res = read_file(p)
+    r = batch(p, [{"op": "replace", "anchor": res.lines[0].anchor, "lines": ["A"]},
+                  {"op": "replace", "anchor": res.lines[2].anchor, "lines": ["C"]}])
+    check("batch undo is one step", undo(r.undo).ok is True and
+          open(p).read() == "a\nb\nc\n")
+
+    # --- content from a file/stdin: a trailing newline is a terminator ---
+    stage = os.path.join(d, "stage.new")
+    with open(stage, "w", encoding="utf-8") as f:
+        f.write("X\nY\n")
+    _ow(p, "a\nb\nc\n")
+    res = read_file(p)
+    fake = argparse.Namespace(file=p, anchor=res.lines[0].anchor, end_anchor=None,
+                              new_text=None, file_input=stage, before=False,
+                              preview=False, json=True)
+    _write_cmd(argparse.ArgumentParser(), fake, "replace")
+    check("file content: trailing newline adds no blank line",
+          open(p).read() == "X\nY\nb\nc\n")
+    check("_lines_from_text drops the final newline",
+          _lines_from_text("X\nY\n") == ["X", "Y"])
+    check("_lines_from_text keeps a real blank tail",
+          _lines_from_text("X\n\n") == ["X", ""])
+
     print("\n%s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
 
@@ -998,6 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
                 "  ./hedit.py delete foo.py 12#NKA\n"
                 "  echo '{\"edits\":[...]}' | ./hedit.py batch foo.py\n"
                 "  echo '{\"edits\":[...]}' | ./hedit.py batch foo.py --preview   # show diff, no write\n"
+                "  ./hedit.py undo /tmp/hedit-undo/foo.py-1a2b3c4d-x1y2.json   # revert that write\n"
                 "  ./hedit.py --selftest"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1050,6 +1489,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="print diff without writing")
     p_batch.add_argument("--json", action="store_true", help="JSON output (with --preview)")
 
+    p_undo = sub.add_parser("undo", help="revert the write a receipt records")
+    p_undo.add_argument("receipt", help="the .undo path an edit returned")
+
     parser.add_argument("--selftest", action="store_true", help="run self tests")
     args = parser.parse_args(argv)
 
@@ -1069,6 +1511,14 @@ def main(argv: list[str] | None = None) -> int:
         return _write_cmd(parser, args, "delete")
     if args.cmd == "batch":
         return _batch_cmd(parser, args)
+    if args.cmd == "undo":
+        try:
+            res = undo(args.receipt)
+        except UsageError as e:
+            print(json.dumps({"ok": False, "error": "usage", "message": str(e)}))
+            return 2
+        print(json.dumps(res.to_json()))
+        return 0 if res.ok else 1
     parser.print_help()
     return 2
 
